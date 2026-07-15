@@ -1,73 +1,156 @@
-# Nest applications
+# Project Sparrow
 
-The `apps/` folder is for **local product checkouts only**. Nest git **ignores everything here except this README** — product source is never committed to the framework repo.
+A modular infrastructure monitoring system — think Zabbix/Nagios, rebuilt on
+[`pacificnm/nest`](https://github.com/pacificnm/nest), our own Rust
+application framework. Sparrow follows a pub/sub, IoT-style architecture:
+lightweight **Agents** run on monitored hosts, publish metrics over MQTT, and
+a central **Server** ingests, stores, evaluates, and (eventually) explains
+what's going on.
 
-Clone a product repo into `apps/<name>/` for side-by-side development with `core/` and `modules/`:
+> **Status:** Planning complete (plan v5, 15 documents). No implementation
+> has started yet. Framework prerequisite work (Phases 1–3) is next.
 
-```text
-nest/
-├── core/crates/
-├── modules/crates/
-└── apps/
-    ├── README.md           # tracked by nest
-    └── airtable-sync/      # git clone — ignored by nest
+---
+
+## Why this exists
+
+Existing tools (Zabbix, Nagios) are poll-based, heavyweight, and not built
+around our own platform conventions. Sparrow reuses `nest`'s existing
+building blocks — HTTP client/server, Postgres data layer, AI provider
+abstraction, task runtime, CLI bootstrap — and adds the pieces `nest`
+doesn't have yet (MQTT, a Claude-backed AI provider) as proper framework
+modules, not one-off hacks bolted onto the product repo.
+
+## Architecture
+
+```
+┌─────────────┐        MQTT (pub/sub)        ┌─────────────┐
+│   Agent     │ ───────────────────────────▶ │   Server    │
+│ (nest-cli)  │ ◀─────────────────────────── │(nest-http-  │
+│             │      retained config push      │   serve)   │
+└─────────────┘                                └─────────────┘
+      │                                              │
+ Collectors                                    Postgres (+ pgvector)
+ (cpu/memory/disk)                             AI Health Analyst
 ```
 
-## Setup
+- **Collectors** — modular metric producers (`cpu`, `memory`, `disk` to
+  start). Pure, testable, no knowledge of transport or scheduling.
+- **Agent** — a `nest-cli` binary. Runs collectors on their own intervals,
+  publishes batched metrics + heartbeat over MQTT, applies live config
+  pushed from the server via retained messages.
+- **Server** — a `nest-http-serve` host. Ingests agent data, persists to
+  Postgres, evaluates alerting rules, exposes a REST API, and runs the AI
+  Health Analyst.
 
-```bash
-git clone https://github.com/pacificnm/airtable-sync.git apps/airtable-sync
+### Deliberate deviations from Zabbix's model
+
+- **Retained MQTT config push** instead of active-check polling — an agent
+  gets its latest config immediately on connect, no round trip needed.
+- **MQTT Last-Will-and-Testament (LWT)** instead of availability polling —
+  near-instant offline detection on unclean disconnect, backed by a periodic
+  polling sweep as a backstop for the "hung but still connected" case.
+
+## Repo layout
+
+```
+sparrow/
+├── crates/
+│   ├── core/       # shared domain logic: Collector trait, topic taxonomy,
+│   │                 storage, trigger/alerting model, AI analyst tools
+│   ├── agent/       # nest-cli binary
+│   └── server/      # nest-http-serve binary
+├── desktop/         # nest-tauri dashboard (later phase)
+└── deploy/          # systemd units, docker-compose, broker config
 ```
 
-Framework consumers who do not need Pacific NM products can skip this entirely — `apps/` stays empty (or absent).
+## Built on `nest`
 
-## Pacific NM products
+Sparrow depends on existing, real `nest` modules:
+`nest-core`, `nest-cli`, `nest-http-client`, `nest-http-serve`,
+`nest-data-postgres`, `nest-task-runtime`, `nest-ai`, `nest-ai-ollama`,
+`nest-claude`.
 
-| Local path | Repository |
-|------------|------------|
-| `apps/airtable-sync/` | [github.com/pacificnm/airtable-sync](https://github.com/pacificnm/airtable-sync) |
-| `apps/loon/` | [github.com/pacificnm/loon](https://github.com/pacificnm/loon) — [plan](loon/docs/v1.md) (clone into `apps/loon/`) |
-| `apps/swift/` | Local checkout — [docs](swift/docs/README.md) (PM + knowledge + AI; reference Tauri desktop app) |
+Two pieces of framework work are prerequisites for Sparrow itself and are
+being built/hardened in the `nest` repo first:
 
-Planned: `kiwi`, `finch`, …
+| Module | What it is |
+|---|---|
+| `nest-mqtt` | New. `rumqttc`-backed MQTT client + module, mirroring `nest-http-client`'s shape. |
+| `nest-ai-claude` | New. A thin `AiProvider` adapter wrapping `nest-claude`, so Ollama and Claude are swappable via config for the AI Health Analyst. |
+| `nest-data-postgres` | Existing, hardened. Adds connect retry/backoff; test suite retrofitted to `testcontainers-rs`. |
 
-All products follow the [Nest app standard](../docs/app-standard.md): one Rust core, host adapters for CLI / TUI / desktop, and Tauri IPC only at the React webview boundary. **Desktop apps** use `ui/` + `src-tauri/` (Tauri + React + Tailwind). See also [nest-tauri v1 plan](../docs/plan/nest-tauri-v1.md).
+## Phase plan
 
-### Loon
+| # | Phase | Repo |
+|---|---|---|
+| 0 | Foundations & decisions (no code) | — |
+| 1 | Harden + retrofit `nest-data-postgres` | `nest` |
+| 2 | Build `nest-mqtt` | `nest` |
+| 3 | Build `nest-ai-claude` | `nest` |
+| 4 | Sparrow core contracts (`Collector`, topics, storage) | `sparrow` |
+| 5 | Collectors (`cpu`, `memory`, `disk`) | `sparrow` |
+| 6 | Agent | `sparrow` |
+| 7 | Server | `sparrow` |
+| 8 | Trigger / alerting engine | `sparrow` |
+| 9 | Server → agent config push | `sparrow` |
+| 10 | AI Health Analyst | `sparrow` |
+| 11 | Desktop dashboard (`nest-tauri`) | `sparrow` |
+| 12 | Security hardening (TLS, broker ACLs) | `sparrow` + `nest` |
+| 13 | Packaging & deployment | `sparrow` |
+| 14 | Testing, docs, polish | `sparrow` |
 
-```bash
-git clone https://github.com/pacificnm/loon.git apps/loon
-```
+Phases 1–3 (framework prerequisites) are unblocked and come first. Phase 11
+(desktop dashboard) is deliberately deferred until the core data path and
+alerting are proven out.
 
-See [apps/loon/docs/implementation-v1.md](loon/docs/implementation-v1.md) for build order.
+Detailed, task-by-task specs for every phase live in this project's
+knowledge area, written to be executable by a local low-cost model (Qwen via
+Ollama) without further clarification.
 
-### Swift
+## Key design decisions (locked, v5)
 
-Personal project management + knowledge + Ollama assistant. Specs and plans: [apps/swift/docs/](swift/docs/README.md). Scaffold from [templates/desktop/](../templates/desktop/) into `apps/swift/`.
+1. **`nest-data-postgres` tests get retrofitted to `testcontainers-rs`**,
+   not just left alone — establishes one consistent testing convention
+   (automatic container spin-up/teardown, no `DATABASE_URL` env var, no
+   `--ignored` flag) across every new and touched module.
+2. **Desktop dashboard is a later phase** — after the core data path and
+   alerting are proven.
+3. **`nest-ai-claude` is a proper adapter, not a hardcoded choice** — the AI
+   Health Analyst is swappable between local Ollama and Claude via
+   `nest-ai`'s `AiProvider` trait from day one.
 
-See [apps/swift/docs/README.md](swift/docs/README.md) and [swift-v1 plan](swift/docs/plan/swift-v1.md).
+## Testing convention
 
-## Build (example)
+`testcontainers-rs` for all new and touched test infrastructure — Postgres,
+Mosquitto, and pgvector-enabled Postgres containers spin up and tear down
+automatically per test run. No manual environment setup, no `--ignored`
+flags.
 
-Every product uses the same **`./build`** commands. See [docs/build.md](../docs/build.md).
+## AI Health Analyst
 
-```bash
-cd apps/airtable-sync
-cp config.example.toml config.toml
-export AIRTABLE_TOKEN="pat..."
-./build build
-./build run -- tables
-```
+In scope for Phase 10. A tool-calling loop (built in Sparrow, not the
+framework) that lets the model query Sparrow's own data —
+`get_host_status`, `get_metric_history`, `get_active_problems`, and
+`search_similar_incidents` (pgvector similarity search over past resolved
+incidents) — to help explain and resolve Problems. Runs against whichever
+`AiProvider` is configured (Ollama or Claude), no analyst code depends on
+either provider directly.
 
-| Command | Use when |
-|---------|----------|
-| `./build dev` | Daily development (Tauri/Vite or cargo run) |
-| `./build run` | Launch the app |
-| `./build build` | Production artifacts (default) |
-| `./build test` | Run tests |
-| `./build clean` | Remove build output |
+## Working principles
 
-The product repo's `.cargo/config.toml` path-patches Nest crates from this layout (`../../core/…`, `../../modules/…`).
+- **Accuracy over assumption.** Specs are written against verified source
+  (real function signatures, real file paths), not plausible-sounding
+  guesses. Where something wasn't verified, the spec says so explicitly
+  (`todo!()` / "check before writing this" markers) rather than fabricating
+  detail.
+- **Thoroughness before speed.** All 14 phase specs and the 23-issue
+  framework-prerequisite issue list were written before any implementation
+  began.
+- **"Nest" always means `pacificnm/nest`** — our own framework, not Node's
+  NestJS. Worth over-clarifying in docs and code comments.
 
-**Dependency rule:** products depend on Nest core and modules only. See [docs/architecture.md](../docs/architecture.md) and [docs/app-standard.md](../docs/app-standard.md).
-# sparrow
+## Status
+
+Planning is done. Next step: open the 23-issue GitHub breakdown against
+`pacificnm/nest` and start on Phase 1 (`nest-data-postgres` hardening).
