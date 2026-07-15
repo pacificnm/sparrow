@@ -94,6 +94,18 @@ fn value_type_storage_value(value_type: ValueType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use nest_data::DataModule;
+    use nest_data_postgres::{PostgresConfig, PostgresDataModule};
+    use sqlx::Row;
+    use testcontainers_modules::postgres::Postgres as PostgresImage;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::ContainerAsync;
+
+    use crate::collector::MetricItem;
+    use crate::transport::DataBatch;
+
     use super::*;
 
     #[test]
@@ -101,5 +113,200 @@ mod tests {
         assert_eq!(value_type_storage_value(ValueType::Float), "float");
         assert_eq!(value_type_storage_value(ValueType::Integer), "integer");
         assert_eq!(value_type_storage_value(ValueType::Text), "text");
+    }
+
+    /// Holds a running container alive for the test's duration; dropping it stops it.
+    /// Same testcontainers-rs convention as `pacificnm/nest`'s Phase 1-2 test support.
+    struct TestDb {
+        _container: ContainerAsync<PostgresImage>,
+        pool: PgPool,
+    }
+
+    async fn start_postgres_with_schema() -> TestDb {
+        let container = PostgresImage::default()
+            .start()
+            .await
+            .expect("failed to start postgres testcontainer");
+        let host = container.get_host().await.expect("container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("container port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+        nest_core::AppBuilder::new()
+            .module(DataModule)
+            .module(
+                PostgresDataModule::new(PostgresConfig::new(url.clone()))
+                    .with_migrations(crate::migrations::all_migrations()),
+            )
+            .build()
+            .expect("app with postgres migrations");
+
+        let pool = PgPool::connect(&url).await.expect("fresh postgres pool");
+
+        TestDb {
+            _container: container,
+            pool,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_registry_upsert_heartbeat_offline_round_trip() {
+        let db = start_postgres_with_schema().await;
+        let registry = HostRegistry::new(db.pool.clone());
+        let host_id = "host-registry-round-trip";
+
+        registry
+            .upsert_on_register(host_id, "sparrow-host")
+            .await
+            .expect("upsert_on_register should succeed");
+
+        let row = sqlx::query(
+            "SELECT hostname, online, last_seen IS NOT NULL AS has_last_seen \
+             FROM hosts WHERE host_id = $1",
+        )
+        .bind(host_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("host row after register");
+        assert_eq!(row.get::<String, _>("hostname"), "sparrow-host");
+        assert!(row.get::<bool, _>("online"));
+        assert!(row.get::<bool, _>("has_last_seen"));
+
+        // Re-registering the same host_id must update the row, not duplicate it.
+        registry
+            .upsert_on_register(host_id, "sparrow-host-renamed")
+            .await
+            .expect("re-register should succeed");
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hosts WHERE host_id = $1")
+            .bind(host_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("host row count");
+        assert_eq!(row_count, 1);
+        let hostname: String = sqlx::query_scalar("SELECT hostname FROM hosts WHERE host_id = $1")
+            .bind(host_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("updated hostname");
+        assert_eq!(hostname, "sparrow-host-renamed");
+
+        registry
+            .mark_offline(host_id)
+            .await
+            .expect("mark_offline should succeed");
+        let online: bool = sqlx::query_scalar("SELECT online FROM hosts WHERE host_id = $1")
+            .bind(host_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("online after mark_offline");
+        assert!(!online);
+
+        registry
+            .touch_heartbeat(host_id)
+            .await
+            .expect("touch_heartbeat should succeed");
+        let online: bool = sqlx::query_scalar("SELECT online FROM hosts WHERE host_id = $1")
+            .bind(host_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("online after touch_heartbeat");
+        assert!(online);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metric_history_insert_batch_round_trip() {
+        let db = start_postgres_with_schema().await;
+        let host_id = "host-metric-history";
+        HostRegistry::new(db.pool.clone())
+            .upsert_on_register(host_id, "sparrow-host")
+            .await
+            .expect("host must exist before inserting metrics (FK constraint)");
+
+        let batch = DataBatch {
+            host_id: host_id.to_string(),
+            collector: "cpu".to_string(),
+            items: vec![
+                MetricItem {
+                    key: "cpu.usage_percent".to_string(),
+                    value_type: ValueType::Float,
+                    value: "42.5".to_string(),
+                    tags: BTreeMap::from([("core".to_string(), "0".to_string())]),
+                    timestamp_ms: 1_700_000_000_000,
+                },
+                MetricItem {
+                    key: "cpu.core_count".to_string(),
+                    value_type: ValueType::Integer,
+                    value: "8".to_string(),
+                    tags: BTreeMap::new(),
+                    timestamp_ms: 1_700_000_000_500,
+                },
+                MetricItem {
+                    key: "cpu.governor".to_string(),
+                    value_type: ValueType::Text,
+                    value: "performance".to_string(),
+                    tags: BTreeMap::from([("core".to_string(), "1".to_string())]),
+                    timestamp_ms: 1_700_000_001_000,
+                },
+            ],
+        };
+
+        MetricHistory::new(db.pool.clone())
+            .insert_batch(host_id, &batch)
+            .await
+            .expect("insert_batch should succeed");
+
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM metric_history WHERE host_id = $1")
+                .bind(host_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("metric_history row count");
+        assert_eq!(row_count, batch.items.len() as i64);
+
+        let rows = sqlx::query(
+            "SELECT collector, key, value, value_type, tags, ts \
+             FROM metric_history WHERE host_id = $1 ORDER BY key",
+        )
+        .bind(host_id)
+        .fetch_all(&db.pool)
+        .await
+        .expect("metric_history rows");
+
+        let mut expected = batch.items.clone();
+        expected.sort_by(|a, b| a.key.cmp(&b.key));
+
+        assert_eq!(rows.len(), expected.len());
+        for (row, item) in rows.iter().zip(expected.iter()) {
+            assert_eq!(row.get::<String, _>("collector"), batch.collector);
+            assert_eq!(row.get::<String, _>("key"), item.key);
+            assert_eq!(row.get::<String, _>("value"), item.value);
+            assert_eq!(
+                row.get::<String, _>("value_type"),
+                value_type_storage_value(item.value_type)
+            );
+            assert_eq!(
+                row.get::<serde_json::Value, _>("tags"),
+                serde_json::to_value(&item.tags).expect("tags should serialize")
+            );
+            assert_eq!(row.get::<i64, _>("ts"), item.timestamp_ms);
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_batch_with_no_items_is_a_no_op_and_needs_no_connection() {
+        let pool = PgPool::connect_lazy("postgres://sparrow-tests-unused@127.0.0.1/unused")
+            .expect("lazy pool construction should not require a live connection");
+        let batch = DataBatch {
+            host_id: "host-empty".to_string(),
+            collector: "cpu".to_string(),
+            items: Vec::new(),
+        };
+
+        MetricHistory::new(pool)
+            .insert_batch("host-empty", &batch)
+            .await
+            .expect("empty batch should short-circuit before touching the pool");
     }
 }
