@@ -1,0 +1,16 @@
+[package]
+name = "sparrow-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nest-data = { workspace = true }
+nest-mqtt = { workspace = true }
+nest-error = { workspace = true }
+nest-logging = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "json"] }
+thiserror = "1.0"
+
+tokio = { version = "1", features = ["full"] }
