@@ -107,8 +107,14 @@ mod tests {
 
     #[test]
     fn value_type_serializes_snake_case() {
-        assert_eq!(serde_json::to_string(&ValueType::Integer).unwrap(), "\"integer\"");
-        assert_eq!(serde_json::to_string(&ValueType::Float).unwrap(), "\"float\"");
+        assert_eq!(
+            serde_json::to_string(&ValueType::Integer).unwrap(),
+            "\"integer\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ValueType::Float).unwrap(),
+            "\"float\""
+        );
         assert_eq!(serde_json::to_string(&ValueType::Text).unwrap(), "\"text\"");
     }
 }
