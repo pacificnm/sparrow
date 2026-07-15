@@ -14,3 +14,9 @@ sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "json"] }
 thiserror = "1.0"
 
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+nest-core = { workspace = true }
+nest-data = { workspace = true }
+nest-data-postgres = { workspace = true }
+testcontainers-modules = { version = "=0.11.6", features = ["postgres", "blocking"] }

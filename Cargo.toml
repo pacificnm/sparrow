@@ -5,7 +5,9 @@ members = [
 ]
 
 [workspace.dependencies]
+nest-core = { path = "../../core/crates/nest-core" }
 nest-data = { path = "../../core/crates/nest-data" }
+nest-data-postgres = { path = "../../modules/crates/nest-data-postgres" }
 nest-error = { path = "../../core/crates/nest-error" }
 nest-logging = { path = "../../core/crates/nest-logging" }
 nest-mqtt = { path = "../../modules/crates/nest-mqtt" }
