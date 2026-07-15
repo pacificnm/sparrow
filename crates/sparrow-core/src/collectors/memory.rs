@@ -45,18 +45,21 @@ impl Collector for MemoryCollector {
                 "memory.total_bytes",
                 ValueType::Integer,
                 total.to_string(),
+                None,
                 now,
             ),
             super::metric(
                 "memory.used_bytes",
                 ValueType::Integer,
                 used.to_string(),
+                None,
                 now,
             ),
             super::metric(
                 "memory.used_percent",
                 ValueType::Float,
                 format!("{:.2}", percent),
+                None,
                 now,
             ),
         ])
