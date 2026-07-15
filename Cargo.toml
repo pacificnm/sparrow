@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sparrow-core",
+]
+
+[workspace.dependencies]
+nest-data = { path = "../../core/crates/nest-data" }
+nest-error = { path = "../../core/crates/nest-error" }
+nest-logging = { path = "../../core/crates/nest-logging" }
+nest-mqtt = { path = "../../modules/crates/nest-mqtt" }
