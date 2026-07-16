@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use nest_error::NestResult;
 use nest_mqtt::{MqttClient, MqttQos};
 use nest_task::{Task, TaskContext};
+use sparrow_core::interval_task::run_on_interval;
 use sparrow_core::time::now_ms;
 use sparrow_core::transport::{HeartbeatMessage, Topics};
 
 use crate::config::AgentConfig;
-use crate::interval_task::run_on_interval;
 
 /// Heartbeat cadence — hardcoded per spec, not collector-configurable.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);

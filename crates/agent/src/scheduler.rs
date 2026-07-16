@@ -5,9 +5,8 @@ use async_trait::async_trait;
 use nest_error::NestResult;
 use nest_task::{Task, TaskContext};
 use sparrow_core::collector::{Collector, MetricItem};
+use sparrow_core::interval_task::run_on_interval;
 use tokio::sync::Mutex;
-
-use crate::interval_task::run_on_interval;
 
 /// The seam [`CollectorTask`] publishes through.
 ///
