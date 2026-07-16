@@ -37,6 +37,23 @@ impl Topics {
     pub fn all_heartbeat() -> &'static str {
         "sparrow/agents/+/heartbeat"
     }
+
+    /// Extracts the `host_id` segment from a concrete topic matching
+    /// `sparrow/agents/{host_id}/{suffix}` (the shape every per-host topic
+    /// above uses) — the inverse of the formatters above. Needed for the
+    /// server's ingest loops when a message's payload doesn't carry
+    /// `host_id` itself (e.g. the agent's empty-payload LWT on the
+    /// heartbeat topic, which has no payload to parse a host_id out of).
+    /// Returns `None` for topics that don't match this shape.
+    pub fn host_id_from_topic(topic: &str) -> Option<&str> {
+        let parts: Vec<&str> = topic.split('/').collect();
+        if parts.len() == 4 && parts[0] == "sparrow" && parts[1] == "agents" && !parts[2].is_empty()
+        {
+            Some(parts[2])
+        } else {
+            None
+        }
+    }
 }
 
 /// Wire payload published on `data` topics — a batch, not one message per item,
@@ -120,6 +137,29 @@ mod tests {
         assert_eq!(Topics::all_data(), "sparrow/agents/+/data");
         assert_eq!(Topics::all_register(), "sparrow/agents/+/register");
         assert_eq!(Topics::all_heartbeat(), "sparrow/agents/+/heartbeat");
+    }
+
+    #[test]
+    fn host_id_from_topic_extracts_the_host_id_segment() {
+        assert_eq!(
+            Topics::host_id_from_topic("sparrow/agents/host-123/heartbeat"),
+            Some("host-123")
+        );
+        assert_eq!(
+            Topics::host_id_from_topic("sparrow/agents/host-123/data"),
+            Some("host-123")
+        );
+    }
+
+    #[test]
+    fn host_id_from_topic_rejects_topics_that_do_not_match_the_shape() {
+        assert_eq!(Topics::host_id_from_topic("sparrow/agents/heartbeat"), None);
+        assert_eq!(
+            Topics::host_id_from_topic("sparrow/agents//heartbeat"),
+            None
+        );
+        assert_eq!(Topics::host_id_from_topic("not/a/sparrow/topic"), None);
+        assert_eq!(Topics::host_id_from_topic(""), None);
     }
 
     #[test]

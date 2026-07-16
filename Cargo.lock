@@ -2169,6 +2169,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparrow-server"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "nest-error",
+ "nest-mqtt",
+ "sparrow-core",
+ "tracing",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
