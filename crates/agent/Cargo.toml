@@ -7,3 +7,6 @@ edition.workspace = true
 serde = { workspace = true }
 nest-config = { workspace = true }
 nest-error = { workspace = true }
+nest-mqtt = { workspace = true }
+sparrow-core = { path = "../sparrow-core" }
+tokio = { version = "1", features = ["sync"] }
