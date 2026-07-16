@@ -2144,6 +2144,7 @@ dependencies = [
  "serde",
  "sparrow-core",
  "sysinfo",
+ "testcontainers",
  "tokio",
  "tracing",
 ]
