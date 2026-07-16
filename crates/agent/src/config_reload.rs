@@ -4,16 +4,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use nest_core::AppContext;
 use nest_error::NestResult;
 use nest_mqtt::{MqttClient, MqttQos};
-use nest_task::{CancelToken, ProgressReporter, Task, TaskContext, TaskId};
+use nest_task::{Task, TaskContext, TaskHandle, TaskManager};
+use nest_task_runtime::TaskManagerService;
 use sparrow_core::collector::Collector;
 use sparrow_core::collectors::default_collectors;
 use sparrow_core::config::AgentConfigOverride;
 use sparrow_core::transport::Topics;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 use crate::config::AgentConfig;
 use crate::scheduler::{BatchSink, CollectorTask};
@@ -28,9 +27,7 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// One collector's currently-running `CollectorTask`, tracked so a later
 /// config change can be diffed against it.
 struct RunningCollector {
-    cancel: CancelToken,
-    // Kept so the spawned task isn't silently detached; not otherwise polled.
-    _handle: JoinHandle<()>,
+    handle: TaskHandle<()>,
     interval_secs: u64,
 }
 
@@ -47,41 +44,38 @@ struct RunningCollector {
 /// - Collectors whose desired state didn't change are left completely
 ///   alone, including whatever persistent state their `Collector` instance
 ///   holds (e.g. `cpu`'s `sysinfo::System`).
+///
+/// Dynamically-started collectors are spawned through the same
+/// [`TaskManagerService`] `main.rs` uses for the initial task set (not a raw
+/// `tokio::spawn`) — that's what gives them a real `TaskContext` (built from
+/// the app's actual `Arc<AppContext>`, which isn't otherwise reachable from
+/// here) and makes them show up in the same registry/cancellation path as
+/// every other task in the process, not a separate untracked set.
 pub struct ConfigReload {
     client: MqttClient,
     host_id: String,
     sink: Arc<dyn BatchSink>,
-    app: Arc<AppContext>,
+    manager: TaskManagerService,
     running: Mutex<HashMap<&'static str, RunningCollector>>,
 }
 
 impl ConfigReload {
     /// Creates a task that reconciles the running `CollectorTask` set
     /// against `Topics::config(config.host_id)`, publishing batches through
-    /// `sink` and building each spawned `CollectorTask`'s context from `app`.
+    /// `sink` and spawning each replacement `CollectorTask` through `manager`.
     pub fn new(
         client: MqttClient,
         config: &AgentConfig,
         sink: Arc<dyn BatchSink>,
-        app: Arc<AppContext>,
+        manager: TaskManagerService,
     ) -> Self {
         Self {
             client,
             host_id: config.host_id.clone(),
             sink,
-            app,
+            manager,
             running: Mutex::new(HashMap::new()),
         }
-    }
-
-    fn build_context(&self, cancel: CancelToken) -> TaskContext {
-        TaskContext::new(
-            TaskId::new(),
-            Arc::clone(&self.app),
-            cancel,
-            ProgressReporter::new(Arc::new(|_progress| {})),
-            tracing::Span::none(),
-        )
     }
 
     /// Reconciles the running `CollectorTask` set against `override_`,
@@ -122,7 +116,7 @@ impl ConfigReload {
 
         for name in to_stop {
             if let Some(existing) = running.remove(name) {
-                existing.cancel.cancel();
+                existing.handle.cancel();
             }
         }
 
@@ -133,27 +127,26 @@ impl ConfigReload {
                 continue;
             }
 
-            let cancel = CancelToken::new();
             let task = CollectorTask::new(
                 collector,
                 Duration::from_secs(interval),
                 Arc::clone(&self.sink),
             );
-            let ctx = self.build_context(cancel.clone());
-            let handle = tokio::spawn(async move {
-                if let Err(err) = task.run(ctx).await {
-                    tracing::warn!(error = %err, collector = name, "collector task exited with an error");
-                }
-            });
 
-            running.insert(
-                name,
-                RunningCollector {
-                    cancel,
-                    _handle: handle,
-                    interval_secs: interval,
-                },
-            );
+            match self.manager.spawn(task).await {
+                Ok(handle) => {
+                    running.insert(
+                        name,
+                        RunningCollector {
+                            handle,
+                            interval_secs: interval,
+                        },
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, collector = name, "failed to spawn collector task");
+                }
+            }
         }
     }
 }
@@ -204,6 +197,8 @@ mod tests {
     use nest_core::AppBuilder;
     use nest_error::NestResult;
     use nest_mqtt::MqttConfig;
+    use nest_task::TaskStatus;
+    use nest_task_runtime::TaskManagerConfig;
     use sparrow_core::collector::MetricItem;
 
     use super::*;
@@ -247,8 +242,13 @@ mod tests {
             .build()
             .expect("empty app context")
             .context;
+        let manager = TaskManagerService::new(
+            tokio::runtime::Handle::current(),
+            TaskManagerConfig::default(),
+        );
+        manager.set_context(app);
 
-        ConfigReload::new(client, &config, Arc::new(NoopSink), app)
+        ConfigReload::new(client, &config, Arc::new(NoopSink), manager)
     }
 
     #[tokio::test]
@@ -283,10 +283,10 @@ mod tests {
 
         reload.apply(&AgentConfigOverride::default()).await;
 
-        let cpu_cancel_before = {
+        let cpu_id_before = {
             let running = reload.running.lock().await;
             assert!(running.contains_key("memory"));
-            running.get("cpu").expect("cpu running").cancel.clone()
+            running.get("cpu").expect("cpu running").handle.id()
         };
 
         reload
@@ -301,11 +301,13 @@ mod tests {
             !running.contains_key("memory"),
             "memory should have been stopped"
         );
-        assert!(running.contains_key("cpu"), "cpu should still be running");
-        assert!(
-            !cpu_cancel_before.is_cancelled(),
+        let cpu = running.get("cpu").expect("cpu should still be running");
+        assert_eq!(
+            cpu.handle.id(),
+            cpu_id_before,
             "cpu's original task should not have been touched by an unrelated change"
         );
+        assert_ne!(cpu.handle.status(), TaskStatus::Cancelled);
     }
 
     #[tokio::test]
@@ -314,9 +316,9 @@ mod tests {
 
         reload.apply(&AgentConfigOverride::default()).await;
 
-        let cpu_cancel_before = {
+        let cpu_id_before = {
             let running = reload.running.lock().await;
-            running.get("cpu").expect("cpu running").cancel.clone()
+            running.get("cpu").expect("cpu running").handle.id()
         };
 
         reload
@@ -329,12 +331,14 @@ mod tests {
         let running = reload.running.lock().await;
         let cpu_after = running.get("cpu").expect("cpu should still be running");
         assert_eq!(cpu_after.interval_secs, 99);
-        assert!(
-            cpu_cancel_before.is_cancelled(),
-            "the old cpu task should have been cancelled, not mutated in place"
+        assert_ne!(
+            cpu_after.handle.id(),
+            cpu_id_before,
+            "the old cpu task should have been replaced, not mutated in place"
         );
-        assert!(
-            !cpu_after.cancel.is_cancelled(),
+        assert_ne!(
+            cpu_after.handle.status(),
+            TaskStatus::Cancelled,
             "the new cpu task should be running"
         );
     }
@@ -344,17 +348,18 @@ mod tests {
         let reload = test_reload().await;
 
         reload.apply(&AgentConfigOverride::default()).await;
-        let cpu_cancel_first = {
+        let cpu_id_first = {
             let running = reload.running.lock().await;
-            running.get("cpu").expect("cpu running").cancel.clone()
+            running.get("cpu").expect("cpu running").handle.id()
         };
 
         // Same config applied again — nothing should be stopped or restarted.
         reload.apply(&AgentConfigOverride::default()).await;
 
         let running = reload.running.lock().await;
-        assert!(
-            !cpu_cancel_first.is_cancelled(),
+        assert_eq!(
+            running.get("cpu").expect("cpu running").handle.id(),
+            cpu_id_first,
             "re-applying an unchanged config must not disturb already-running collectors"
         );
         assert_eq!(

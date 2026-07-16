@@ -10,6 +10,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
+nest-cli = { path = "../../core/crates/nest-cli" }
 nest-core = { path = "../../core/crates/nest-core" }
 nest-data = { path = "../../core/crates/nest-data" }
 nest-data-postgres = { path = "../../modules/crates/nest-data-postgres" }
@@ -18,4 +19,5 @@ nest-logging = { path = "../../core/crates/nest-logging" }
 nest-mqtt = { path = "../../modules/crates/nest-mqtt" }
 nest-config = { path = "../../core/crates/nest-config" }
 nest-task = { path = "../../core/crates/nest-task" }
+nest-task-runtime = { path = "../../core/crates/nest-task-runtime" }
 serde = { version = "1", features = ["derive"] }
