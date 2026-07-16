@@ -1283,6 +1283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nest-task"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nest-core",
+ "nest-error",
+ "tracing",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1973,12 +1983,16 @@ dependencies = [
 name = "sparrow-agent"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "nest-config",
+ "nest-core",
  "nest-error",
  "nest-mqtt",
+ "nest-task",
  "serde",
  "sparrow-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
