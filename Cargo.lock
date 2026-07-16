@@ -1975,7 +1975,10 @@ version = "0.1.0"
 dependencies = [
  "nest-config",
  "nest-error",
+ "nest-mqtt",
  "serde",
+ "sparrow-core",
+ "tokio",
 ]
 
 [[package]]
