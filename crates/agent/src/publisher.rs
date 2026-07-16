@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use async_trait::async_trait;
 use nest_error::NestResult;
 use nest_mqtt::{MqttClient, MqttQos};
 use sparrow_core::collector::MetricItem;
@@ -7,6 +8,7 @@ use sparrow_core::transport::{DataBatch, Topics};
 use tokio::sync::Mutex;
 
 use crate::config::AgentConfig;
+use crate::scheduler::BatchSink;
 
 /// Cap on batches held while the broker is unreachable. Oldest batches are
 /// dropped first once the buffer is full — bounded memory over completeness.
@@ -76,5 +78,19 @@ impl Publisher {
         self.client
             .publish(&topic, batch.to_payload(), MqttQos::AtLeastOnce, false)
             .await
+    }
+}
+
+/// Lets [`crate::scheduler::CollectorTask`] publish through the real,
+/// MQTT-backed, outage-buffering `Publisher` — the same
+/// `publish_batch(collector, items)` contract `BatchSink` exists to capture.
+#[async_trait]
+impl BatchSink for Publisher {
+    async fn publish_batch(
+        &self,
+        collector: &'static str,
+        items: Vec<MetricItem>,
+    ) -> NestResult<()> {
+        Publisher::publish_batch(self, collector, items).await
     }
 }
