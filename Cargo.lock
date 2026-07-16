@@ -1984,6 +1984,7 @@ name = "sparrow-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "nest-config",
  "nest-core",
  "nest-error",
