@@ -7,3 +7,11 @@ edition.workspace = true
 serde = { workspace = true }
 nest-config = { workspace = true }
 nest-error = { workspace = true }
+nest-task = { workspace = true }
+sparrow-core = { path = "../sparrow-core" }
+async-trait = "0.1"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+nest-core = { workspace = true }
