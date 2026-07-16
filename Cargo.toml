@@ -19,6 +19,7 @@ nest-error = { path = "../../core/crates/nest-error" }
 nest-logging = { path = "../../core/crates/nest-logging" }
 nest-mqtt = { path = "../../modules/crates/nest-mqtt" }
 nest-config = { path = "../../core/crates/nest-config" }
+nest-http-serve = { path = "../../core/crates/nest-http-serve" }
 nest-task = { path = "../../core/crates/nest-task" }
 nest-task-runtime = { path = "../../core/crates/nest-task-runtime" }
 serde = { version = "1", features = ["derive"] }
