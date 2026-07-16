@@ -106,8 +106,12 @@ impl HostRegistry {
 /// a round-trip through the same typed wire contract `DataBatch` uses, and
 /// adding an `sqlx::Type` mapping for `ValueType` just for this one read
 /// isn't worth it over exposing the same string already sitting in the row.
+///
+/// Shared by both `latest_items` (one row per key) and `history` (a
+/// timestamp-ordered range for one key) — same five columns either way, so
+/// one row type for both rather than two structurally-identical ones.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
-pub struct LatestMetricItem {
+pub struct MetricHistoryRow {
     pub collector: String,
     pub key: String,
     pub value: String,
@@ -158,8 +162,8 @@ impl MetricHistory {
     /// `GET /hosts/:id/items`. A single `DISTINCT ON` query, not a fetch-all
     /// followed by filtering in Rust — `metric_history` can be arbitrarily
     /// large per host, and this only ever needs the latest row per key.
-    pub async fn latest_items(&self, host_id: &str) -> sqlx::Result<Vec<LatestMetricItem>> {
-        sqlx::query_as::<_, LatestMetricItem>(
+    pub async fn latest_items(&self, host_id: &str) -> sqlx::Result<Vec<MetricHistoryRow>> {
+        sqlx::query_as::<_, MetricHistoryRow>(
             "SELECT DISTINCT ON (key) collector, key, value, value_type, tags, ts
              FROM metric_history
              WHERE host_id = $1
@@ -168,6 +172,49 @@ impl MetricHistory {
         .bind(host_id)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Returns rows for one `(host_id, key)`, newest first, optionally
+    /// bounded by `from_ms`/`to_ms` (inclusive) and always capped at
+    /// `limit` — the caller (`api/history.rs`) is responsible for
+    /// defaulting/clamping `limit` to a sane bound before calling this; this
+    /// method just executes whatever it's given, matching every other
+    /// method here trusting its caller rather than re-validating.
+    ///
+    /// Matches `idx_metric_history_host_key_ts (host_id, key, ts DESC)`
+    /// exactly: equality on `host_id`/`key`, a range on `ts`, ordered by
+    /// `ts DESC` — no new index needed.
+    pub async fn history(
+        &self,
+        host_id: &str,
+        key: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        limit: i64,
+    ) -> sqlx::Result<Vec<MetricHistoryRow>> {
+        let mut builder = sqlx::QueryBuilder::new(
+            "SELECT collector, key, value, value_type, tags, ts FROM metric_history WHERE host_id = ",
+        );
+        builder.push_bind(host_id);
+        builder.push(" AND key = ");
+        builder.push_bind(key);
+
+        if let Some(from_ms) = from_ms {
+            builder.push(" AND ts >= ");
+            builder.push_bind(from_ms);
+        }
+        if let Some(to_ms) = to_ms {
+            builder.push(" AND ts <= ");
+            builder.push_bind(to_ms);
+        }
+
+        builder.push(" ORDER BY ts DESC LIMIT ");
+        builder.push_bind(limit);
+
+        builder
+            .build_query_as::<MetricHistoryRow>()
+            .fetch_all(&self.pool)
+            .await
     }
 }
 
@@ -548,6 +595,100 @@ mod tests {
             .find(|item| item.key == "memory.used_bytes")
             .expect("memory.used_bytes present");
         assert_eq!(memory.value, "12345");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_respects_range_and_limit_and_orders_newest_first() {
+        let db = start_postgres_with_schema().await;
+        let host_id = "host-history";
+        HostRegistry::new(db.pool.clone())
+            .upsert_on_register(host_id, "sparrow-host")
+            .await
+            .expect("host must exist before inserting metrics (FK constraint)");
+        let history = MetricHistory::new(db.pool.clone());
+
+        // Five points 1000ms apart, plus one unrelated key that must never
+        // appear in cpu.usage_percent's history.
+        for (i, value) in ["1", "2", "3", "4", "5"].iter().enumerate() {
+            history
+                .insert_batch(
+                    host_id,
+                    &DataBatch {
+                        host_id: host_id.to_string(),
+                        collector: "cpu".to_string(),
+                        items: vec![MetricItem {
+                            key: "cpu.usage_percent".to_string(),
+                            value_type: ValueType::Float,
+                            value: value.to_string(),
+                            tags: BTreeMap::new(),
+                            timestamp_ms: 1_700_000_000_000 + (i as i64) * 1000,
+                        }],
+                    },
+                )
+                .await
+                .expect("insert cpu point");
+        }
+        history
+            .insert_batch(
+                host_id,
+                &DataBatch {
+                    host_id: host_id.to_string(),
+                    collector: "memory".to_string(),
+                    items: vec![MetricItem {
+                        key: "memory.used_bytes".to_string(),
+                        value_type: ValueType::Integer,
+                        value: "999".to_string(),
+                        tags: BTreeMap::new(),
+                        timestamp_ms: 1_700_000_002_500,
+                    }],
+                },
+            )
+            .await
+            .expect("insert unrelated memory point");
+
+        // No bounds, generous limit: all 5 cpu points, newest first.
+        let all = history
+            .history(host_id, "cpu.usage_percent", None, None, 100)
+            .await
+            .expect("history should succeed");
+        assert_eq!(
+            all.iter().map(|row| row.value.as_str()).collect::<Vec<_>>(),
+            vec!["5", "4", "3", "2", "1"],
+            "should be ordered newest first and exclude other keys"
+        );
+
+        // Range bounds: only points 2 (ts=...002000) through 4
+        // (ts=...004000) inclusive.
+        let ranged = history
+            .history(
+                host_id,
+                "cpu.usage_percent",
+                Some(1_700_000_002_000),
+                Some(1_700_000_004_000),
+                100,
+            )
+            .await
+            .expect("ranged history should succeed");
+        assert_eq!(
+            ranged
+                .iter()
+                .map(|row| row.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["4", "3", "2"]
+        );
+
+        // Limit caps the result even when more rows match.
+        let limited = history
+            .history(host_id, "cpu.usage_percent", None, None, 2)
+            .await
+            .expect("limited history should succeed");
+        assert_eq!(
+            limited
+                .iter()
+                .map(|row| row.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5", "4"]
+        );
     }
 
     #[tokio::test]
