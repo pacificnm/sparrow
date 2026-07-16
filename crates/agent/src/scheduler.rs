@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nest_error::NestResult;
@@ -7,14 +7,7 @@ use nest_task::{Task, TaskContext};
 use sparrow_core::collector::{Collector, MetricItem};
 use tokio::sync::Mutex;
 
-/// Cadence at which [`CollectorTask::run`] polls for cancellation.
-///
-/// `CancelToken::is_cancelled()` is a poll, not an awaitable future, so a
-/// loop that only checks it once per collector interval (e.g. `disk`'s 60s)
-/// would leave shutdown waiting up to that long. Polling on a short, fixed
-/// cadence independent of the collector's own interval bounds that latency
-/// to ~1s regardless of how long any given collector's interval is.
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+use crate::interval_task::run_on_interval;
 
 /// The seam [`CollectorTask`] publishes through.
 ///
@@ -78,37 +71,26 @@ impl Task for CollectorTask {
     }
 
     async fn run(&self, ctx: TaskContext) -> NestResult<()> {
-        // Run immediately on the first loop iteration rather than waiting a
-        // full interval before the first collection.
-        let mut last_run = Instant::now() - self.interval;
+        run_on_interval(self.interval, ctx.cancel_token(), || async {
+            let collected = {
+                let mut collector = self.collector.lock().await;
+                collector.collect()
+            };
 
-        loop {
-            if ctx.cancel_token().is_cancelled() {
-                return Ok(());
-            }
-
-            if last_run.elapsed() >= self.interval {
-                let collected = {
-                    let mut collector = self.collector.lock().await;
-                    collector.collect()
-                };
-
-                match collected {
-                    Ok(items) => {
-                        if let Err(err) = self.sink.publish_batch(self.name, items).await {
-                            tracing::warn!(error = %err, collector = self.name, "failed to publish batch");
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, collector = self.name, "collector failed");
+            match collected {
+                Ok(items) => {
+                    if let Err(err) = self.sink.publish_batch(self.name, items).await {
+                        tracing::warn!(error = %err, collector = self.name, "failed to publish batch");
                     }
                 }
-
-                last_run = Instant::now();
+                Err(err) => {
+                    tracing::warn!(error = %err, collector = self.name, "collector failed");
+                }
             }
+        })
+        .await;
 
-            tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
-        }
+        Ok(())
     }
 }
 
