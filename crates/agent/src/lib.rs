@@ -3,6 +3,5 @@
 pub mod config;
 pub mod config_reload;
 pub mod heartbeat;
-pub mod interval_task;
 pub mod publisher;
 pub mod scheduler;

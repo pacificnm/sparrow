@@ -2159,6 +2159,7 @@ dependencies = [
  "nest-error",
  "nest-logging",
  "nest-mqtt",
+ "nest-task",
  "serde",
  "serde_json",
  "sqlx",
@@ -2172,9 +2173,11 @@ dependencies = [
 name = "sparrow-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures-util",
  "nest-error",
  "nest-mqtt",
+ "nest-task",
  "sparrow-core",
  "tracing",
 ]

@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 nest-error = { workspace = true }
 nest-mqtt = { workspace = true }
+nest-task = { workspace = true }
 sparrow-core = { path = "../sparrow-core" }
+async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"

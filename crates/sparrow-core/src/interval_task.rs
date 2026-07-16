@@ -1,10 +1,18 @@
 //! Shared interval-loop-with-cancel-poll driver.
 //!
 //! `nest-task`'s `TaskManager::spawn` runs a `Task` exactly once — there is
-//! no built-in interval scheduling — so every long-running, periodic task in
-//! this crate ([`crate::scheduler::CollectorTask`], [`crate::heartbeat::HeartbeatTask`])
-//! drives its own interval loop. Rather than each hand-rolling one, both call
-//! [`run_on_interval`] so the cancel-poll shape exists in exactly one place.
+//! no built-in interval scheduling — so every long-running, periodic task
+//! across Sparrow (`sparrow-agent`'s `CollectorTask`/`HeartbeatTask`,
+//! `sparrow-server`'s `OfflineWatch`) drives its own interval loop. Rather
+//! than each hand-rolling one, all of them call [`run_on_interval`] so the
+//! cancel-poll shape exists in exactly one place — hence living here, in the
+//! crate both already depend on, rather than in either one specifically.
+//!
+//! Originally written in `sparrow-agent` (Phase 6); relocated here (Phase 7)
+//! when `sparrow-server`'s `offline_watch.rs` needed the same shape and
+//! depending on `sparrow-agent` just to reuse one generic function would
+//! have dragged its CLI-specific dependencies (`nest-cli`, `clap`,
+//! `sysinfo`) into the server for no reason.
 
 use std::future::Future;
 use std::time::{Duration, Instant};

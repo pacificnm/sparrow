@@ -46,6 +46,24 @@ impl HostRegistry {
             .await?;
         Ok(())
     }
+
+    /// Marks every currently-online host whose `last_seen` is older than
+    /// `stale_after_secs` as offline. Returns the number of hosts actually
+    /// updated (0 if none are stale) — used by `sparrow-server`'s periodic
+    /// backstop sweep (`offline_watch.rs`) to detect agents that hang without
+    /// ever triggering a disconnect (so MQTT's LWT never fires).
+    pub async fn mark_stale_offline(&self, stale_after_secs: i64) -> sqlx::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE hosts
+             SET online = false
+             WHERE online = true
+               AND last_seen < NOW() - ($1 * INTERVAL '1 second')",
+        )
+        .bind(stale_after_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 /// High-frequency metric persistence using one multi-row insert per batch.
@@ -213,6 +231,62 @@ mod tests {
             .await
             .expect("online after touch_heartbeat");
         assert!(online);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mark_stale_offline_marks_only_hosts_past_the_threshold() {
+        let db = start_postgres_with_schema().await;
+        let registry = HostRegistry::new(db.pool.clone());
+
+        let stale_host = "host-stale";
+        let fresh_host = "host-fresh";
+        registry
+            .upsert_on_register(stale_host, "stale-host")
+            .await
+            .expect("register stale host");
+        registry
+            .upsert_on_register(fresh_host, "fresh-host")
+            .await
+            .expect("register fresh host");
+
+        // Backdate only the stale host's last_seen — upsert_on_register
+        // always sets it to NOW(), so there's no HostRegistry method for
+        // seeding an arbitrary timestamp; this is test-only setup.
+        sqlx::query("UPDATE hosts SET last_seen = NOW() - INTERVAL '1 hour' WHERE host_id = $1")
+            .bind(stale_host)
+            .execute(&db.pool)
+            .await
+            .expect("backdate stale host's last_seen");
+
+        let updated = registry
+            .mark_stale_offline(45)
+            .await
+            .expect("mark_stale_offline should succeed");
+        assert_eq!(updated, 1, "exactly one host should have been stale");
+
+        let stale_online: bool = sqlx::query_scalar("SELECT online FROM hosts WHERE host_id = $1")
+            .bind(stale_host)
+            .fetch_one(&db.pool)
+            .await
+            .expect("stale host online status");
+        assert!(!stale_online, "the stale host should be marked offline");
+
+        let fresh_online: bool = sqlx::query_scalar("SELECT online FROM hosts WHERE host_id = $1")
+            .bind(fresh_host)
+            .fetch_one(&db.pool)
+            .await
+            .expect("fresh host online status");
+        assert!(fresh_online, "the fresh host should be left untouched");
+
+        // Re-running the sweep with nothing newly stale should be a no-op.
+        let updated_again = registry
+            .mark_stale_offline(45)
+            .await
+            .expect("second sweep should succeed");
+        assert_eq!(
+            updated_again, 0,
+            "already-offline hosts should not be counted again"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

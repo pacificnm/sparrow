@@ -8,6 +8,7 @@ nest-data = { workspace = true }
 nest-mqtt = { workspace = true }
 nest-error = { workspace = true }
 nest-logging = { workspace = true }
+nest-task = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "json"] }
