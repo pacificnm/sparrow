@@ -2,7 +2,12 @@
 resolver = "2"
 members = [
     "crates/sparrow-core",
+    "crates/agent",
 ]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
 
 [workspace.dependencies]
 nest-core = { path = "../../core/crates/nest-core" }
@@ -11,3 +16,5 @@ nest-data-postgres = { path = "../../modules/crates/nest-data-postgres" }
 nest-error = { path = "../../core/crates/nest-error" }
 nest-logging = { path = "../../core/crates/nest-logging" }
 nest-mqtt = { path = "../../modules/crates/nest-mqtt" }
+nest-config = { path = "../../core/crates/nest-config" }
+serde = { version = "1", features = ["derive"] }

@@ -1970,6 +1970,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparrow-agent"
+version = "0.1.0"
+dependencies = [
+ "nest-config",
+ "nest-error",
+ "serde",
+]
+
+[[package]]
 name = "sparrow-core"
 version = "0.1.0"
 dependencies = [
