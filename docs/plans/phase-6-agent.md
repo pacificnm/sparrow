@@ -180,15 +180,27 @@ place.
 Subscribe to `Topics::config(host_id)` once at startup (retained message —
 the agent gets the last-published config immediately on subscribe, even if
 it was published while the agent was offline, per MQTT retained-message
-semantics confirmed in Phase 2's design). On each message, parse the new
-`AgentConfig`, diff against the currently-running set of `CollectorTask`s,
-and:
+semantics confirmed in Phase 2's design). On each message, parse the payload
+and diff against the currently-running set of `CollectorTask`s, and:
 - Stop (cancel) tasks for collectors newly in `disabled_collectors`.
 - Start new `CollectorTask`s for collectors newly enabled.
 - For interval changes on already-running collectors, the simplest correct
   approach is: cancel the existing task, spawn a new one with the new
   interval — do not try to mutate a running task's interval in place, that's
   meaningfully more complex for marginal benefit at Sparrow's scale.
+
+**Wire type:** the retained message is **not** a full `AgentConfig` — it's
+`sparrow_core::config::AgentConfigOverride` (`disabled_collectors` +
+`collector_intervals` only; no `host_id`/`broker_host`/`broker_port`, which
+are agent-local and the server never sets). This type lives in
+`sparrow-core`, not `crates/agent`, because Phase 9 (`docs/plans/phase-9-config-push.md`)
+needs the exact same shape server-side to construct and persist it — see
+that doc's "Design" section for the full rationale. Phase 9 is written
+*after* this phase but depends on this exact type already existing with
+this exact shape; if you're implementing `config_reload.rs` before Phase 9
+exists, define `AgentConfigOverride` now rather than inventing an
+agent-local config-change shape that Phase 9 would later have to reconcile
+against.
 
 ### `main.rs`
 
