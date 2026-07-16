@@ -1,13 +1,35 @@
+use serde::Serialize;
 use sqlx::{types::Json, PgPool};
 
 use crate::collector::ValueType;
 use crate::transport::DataBatch;
+
+/// One row from `hosts`, as returned to API clients.
+///
+/// `last_seen_ms` is epoch milliseconds, not a native timestamp type —
+/// consistent with every other wire/storage timestamp in this codebase
+/// (`MetricItem::timestamp_ms`, `HeartbeatMessage::timestamp_ms`,
+/// `sparrow_core::time::now_ms`), rather than introducing `sqlx`'s
+/// `chrono`/`time` feature (not currently enabled) just for this one field.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct HostRow {
+    pub host_id: String,
+    pub hostname: String,
+    pub online: bool,
+    pub last_seen_ms: i64,
+}
 
 /// Low-frequency persistence for agent registration and liveness.
 ///
 /// These operations deliberately use direct SQL rather than
 /// `nest_data::AsyncRepository`: they are narrow state transitions, not a
 /// general-purpose per-row CRUD surface.
+///
+/// `Clone` (cheap — `PgPool` is an `Arc`-backed handle) so HTTP route
+/// closures can each hold their own owned copy per request, since
+/// `nest-http-serve` handlers have no other way to reach shared state (see
+/// `api/hosts.rs`'s `routes()`).
+#[derive(Clone)]
 pub struct HostRegistry {
     pool: PgPool,
 }
@@ -64,6 +86,34 @@ impl HostRegistry {
         .await?;
         Ok(result.rows_affected())
     }
+
+    /// Lists every host, for `GET /hosts`.
+    pub async fn list(&self) -> sqlx::Result<Vec<HostRow>> {
+        sqlx::query_as::<_, HostRow>(
+            "SELECT host_id, hostname, online,
+                    (EXTRACT(EPOCH FROM last_seen) * 1000)::BIGINT AS last_seen_ms
+             FROM hosts
+             ORDER BY host_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+}
+
+/// One row from `metric_history`, as returned to API clients — the raw
+/// stored `value_type` string ("float"/"integer"/"text"), not
+/// `crate::collector::ValueType`: this is a read path back out to JSON, not
+/// a round-trip through the same typed wire contract `DataBatch` uses, and
+/// adding an `sqlx::Type` mapping for `ValueType` just for this one read
+/// isn't worth it over exposing the same string already sitting in the row.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct LatestMetricItem {
+    pub collector: String,
+    pub key: String,
+    pub value: String,
+    pub value_type: String,
+    pub tags: serde_json::Value,
+    pub ts: i64,
 }
 
 /// High-frequency metric persistence using one multi-row insert per batch.
@@ -71,6 +121,9 @@ impl HostRegistry {
 /// The migration stores `value_type` as `TEXT` and `tags` as `JSONB`. Values
 /// are therefore encoded as stable snake-case labels and SQLx's typed JSON
 /// wrapper rather than debug output or an intermediate `serde_json::Value`.
+///
+/// `Clone` for the same reason as `HostRegistry` — see its doc comment.
+#[derive(Clone)]
 pub struct MetricHistory {
     pool: PgPool,
 }
@@ -99,6 +152,22 @@ impl MetricHistory {
         });
         builder.build().execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// Returns the most recent row per distinct `key` under `host_id`, for
+    /// `GET /hosts/:id/items`. A single `DISTINCT ON` query, not a fetch-all
+    /// followed by filtering in Rust — `metric_history` can be arbitrarily
+    /// large per host, and this only ever needs the latest row per key.
+    pub async fn latest_items(&self, host_id: &str) -> sqlx::Result<Vec<LatestMetricItem>> {
+        sqlx::query_as::<_, LatestMetricItem>(
+            "SELECT DISTINCT ON (key) collector, key, value, value_type, tags, ts
+             FROM metric_history
+             WHERE host_id = $1
+             ORDER BY key, ts DESC",
+        )
+        .bind(host_id)
+        .fetch_all(&self.pool)
+        .await
     }
 }
 
@@ -290,6 +359,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn list_returns_every_host_ordered_by_host_id() {
+        let db = start_postgres_with_schema().await;
+        let registry = HostRegistry::new(db.pool.clone());
+
+        registry
+            .upsert_on_register("host-b", "second")
+            .await
+            .expect("register host-b");
+        registry
+            .upsert_on_register("host-a", "first")
+            .await
+            .expect("register host-a");
+        registry
+            .mark_offline("host-b")
+            .await
+            .expect("mark host-b offline");
+
+        let hosts = registry.list().await.expect("list should succeed");
+
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].host_id, "host-a");
+        assert_eq!(hosts[0].hostname, "first");
+        assert!(hosts[0].online);
+        assert!(hosts[0].last_seen_ms > 0);
+        assert_eq!(hosts[1].host_id, "host-b");
+        assert!(!hosts[1].online);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn metric_history_insert_batch_round_trip() {
         let db = start_postgres_with_schema().await;
         let host_id = "host-metric-history";
@@ -366,6 +464,90 @@ mod tests {
             );
             assert_eq!(row.get::<i64, _>("ts"), item.timestamp_ms);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_items_returns_only_the_newest_row_per_key() {
+        let db = start_postgres_with_schema().await;
+        let host_id = "host-latest-items";
+        HostRegistry::new(db.pool.clone())
+            .upsert_on_register(host_id, "sparrow-host")
+            .await
+            .expect("host must exist before inserting metrics (FK constraint)");
+        let history = MetricHistory::new(db.pool.clone());
+
+        // Two batches for cpu.usage_percent, an older and a newer value —
+        // only the newer one should come back. memory.used_bytes has just
+        // one row, and disk never reports at all in this test.
+        history
+            .insert_batch(
+                host_id,
+                &DataBatch {
+                    host_id: host_id.to_string(),
+                    collector: "cpu".to_string(),
+                    items: vec![MetricItem {
+                        key: "cpu.usage_percent".to_string(),
+                        value_type: ValueType::Float,
+                        value: "10.0".to_string(),
+                        tags: BTreeMap::new(),
+                        timestamp_ms: 1_700_000_000_000,
+                    }],
+                },
+            )
+            .await
+            .expect("insert older cpu batch");
+        history
+            .insert_batch(
+                host_id,
+                &DataBatch {
+                    host_id: host_id.to_string(),
+                    collector: "cpu".to_string(),
+                    items: vec![MetricItem {
+                        key: "cpu.usage_percent".to_string(),
+                        value_type: ValueType::Float,
+                        value: "55.5".to_string(),
+                        tags: BTreeMap::new(),
+                        timestamp_ms: 1_700_000_002_000,
+                    }],
+                },
+            )
+            .await
+            .expect("insert newer cpu batch");
+        history
+            .insert_batch(
+                host_id,
+                &DataBatch {
+                    host_id: host_id.to_string(),
+                    collector: "memory".to_string(),
+                    items: vec![MetricItem {
+                        key: "memory.used_bytes".to_string(),
+                        value_type: ValueType::Integer,
+                        value: "12345".to_string(),
+                        tags: BTreeMap::new(),
+                        timestamp_ms: 1_700_000_001_000,
+                    }],
+                },
+            )
+            .await
+            .expect("insert memory batch");
+
+        let items = history
+            .latest_items(host_id)
+            .await
+            .expect("latest_items should succeed");
+
+        assert_eq!(items.len(), 2, "one row per distinct key");
+        let cpu = items
+            .iter()
+            .find(|item| item.key == "cpu.usage_percent")
+            .expect("cpu.usage_percent present");
+        assert_eq!(cpu.value, "55.5", "the newer cpu value should win");
+        assert_eq!(cpu.ts, 1_700_000_002_000);
+        let memory = items
+            .iter()
+            .find(|item| item.key == "memory.used_bytes")
+            .expect("memory.used_bytes present");
+        assert_eq!(memory.value, "12345");
     }
 
     #[tokio::test]
