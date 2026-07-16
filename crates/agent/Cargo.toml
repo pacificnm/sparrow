@@ -1,0 +1,9 @@
+[package]
+name = "sparrow-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+nest-config = { workspace = true }
+nest-error = { workspace = true }
