@@ -1,0 +1,11 @@
+[package]
+name = "sparrow-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nest-error = { workspace = true }
+nest-mqtt = { workspace = true }
+sparrow-core = { path = "../sparrow-core" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tracing = "0.1"

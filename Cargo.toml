@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/sparrow-core",
     "crates/agent",
+    "crates/server",
 ]
 
 [workspace.package]
