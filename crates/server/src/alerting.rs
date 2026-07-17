@@ -11,11 +11,12 @@
 //! is the broader pattern of a `Task` wrapping it).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use nest_error::{NestError, NestResult};
+use nest_http_client::{HttpClientService, HttpRequest};
 use nest_task::{Task, TaskContext};
 use sparrow_core::interval_task::run_on_interval;
 use sparrow_core::time::now_ms;
@@ -45,14 +46,19 @@ pub struct AlertingTask {
     /// instant a `Problem` actually opens (no longer needed once `Open` is
     /// the source of truth).
     condition_since: Mutex<HashMap<(i64, String), Instant>>,
+    /// Notified (via `NotificationSink::notify`) whenever `open_problem`
+    /// actually opens a new `Problem` — tied to that specific state
+    /// transition, not to every evaluation pass (see `open_problem`).
+    sinks: Vec<Arc<dyn NotificationSink>>,
 }
 
 impl AlertingTask {
-    pub fn new(pool: PgPool, interval: Duration) -> Self {
+    pub fn new(pool: PgPool, interval: Duration, sinks: Vec<Arc<dyn NotificationSink>>) -> Self {
         Self {
             pool,
             interval,
             condition_since: Mutex::new(HashMap::new()),
+            sinks,
         }
     }
 
@@ -109,14 +115,14 @@ impl AlertingTask {
         match (condition_true, existing_open) {
             (true, None) if rule.sustained_for_secs <= 0 => {
                 self.clear_condition_since(rule.id, host_id);
-                open_problem(&self.pool, rule, host_id, value).await?;
+                open_problem(&self.pool, &self.sinks, rule, host_id, value).await?;
             }
             (true, None) => {
                 let first_true_at = self.mark_condition_since(rule.id, host_id);
                 let sustain = Duration::from_secs(rule.sustained_for_secs as u64);
                 if first_true_at.elapsed() >= sustain {
                     self.clear_condition_since(rule.id, host_id);
-                    open_problem(&self.pool, rule, host_id, value).await?;
+                    open_problem(&self.pool, &self.sinks, rule, host_id, value).await?;
                 }
                 // Not sustained long enough yet — nothing to do this pass.
             }
@@ -264,13 +270,17 @@ async fn fetch_open_problem(
     .map_err(|error| db_error("failed to fetch open problem", error))
 }
 
+/// Inserts the new `Problem` row and notifies `sinks` — notification is
+/// tied to this specific state transition (a `Problem` actually opening),
+/// not to every evaluation pass, per the issue's explicit instruction.
 async fn open_problem(
     pool: &PgPool,
+    sinks: &[Arc<dyn NotificationSink>],
     rule: &Rule,
     host_id: &str,
     value: f64,
 ) -> NestResult<Problem> {
-    sqlx::query_as::<_, Problem>(
+    let problem = sqlx::query_as::<_, Problem>(
         "INSERT INTO problems (rule_id, host_id, status, opened_at, last_value)
          VALUES ($1, $2, 'open', $3, $4)
          RETURNING id, rule_id, host_id, status, opened_at, resolved_at, last_value",
@@ -281,7 +291,13 @@ async fn open_problem(
     .bind(value)
     .fetch_one(pool)
     .await
-    .map_err(|error| db_error("failed to open problem", error))
+    .map_err(|error| db_error("failed to open problem", error))?;
+
+    for sink in sinks {
+        sink.notify(&problem, rule);
+    }
+
+    Ok(problem)
 }
 
 async fn resolve_problem(pool: &PgPool, problem_id: i64) -> NestResult<()> {
@@ -304,14 +320,99 @@ async fn update_last_value(pool: &PgPool, problem_id: i64, value: f64) -> NestRe
     Ok(())
 }
 
+/// Notified when a [`Problem`] opens (see `open_problem`).
+///
+/// Synchronous by design, not `async` — this keeps `dyn NotificationSink`
+/// usable as a plain trait object (`Arc<dyn NotificationSink>`) without
+/// `async_trait`'s boxing, and it matches how a sink is actually meant to
+/// behave: a notification is fired off, not awaited as part of the
+/// transition that triggered it. A sink that needs to do async work (like
+/// [`WebhookSink`]) is responsible for spawning it, not blocking `notify`.
+pub trait NotificationSink: Send + Sync {
+    fn notify(&self, problem: &Problem, rule: &Rule);
+}
+
+/// Logs every opened `Problem` at `warn` level. The simplest possible sink —
+/// mainly useful as a default/fallback and for tests.
+pub struct LogSink;
+
+impl NotificationSink for LogSink {
+    fn notify(&self, problem: &Problem, rule: &Rule) {
+        tracing::warn!(
+            problem_id = problem.id,
+            host_id = %problem.host_id,
+            key = %rule.item_key,
+            severity = ?rule.severity,
+            "problem opened"
+        );
+    }
+}
+
+/// JSON body `WebhookSink` posts — a stub shape (this is the "Notification
+/// stub" the phase doc names it), not a stable external contract yet.
+#[derive(serde::Serialize)]
+struct WebhookPayload<'a> {
+    problem: &'a Problem,
+    rule: &'a Rule,
+}
+
+/// Fire-and-forget `POST`s a JSON `{problem, rule}` payload to `url` whenever
+/// a `Problem` opens.
+///
+/// "Fire-and-forget" is why `notify` (a sync fn — see [`NotificationSink`])
+/// spawns the actual request rather than awaiting it inline: the caller
+/// (`open_problem`) gets no feedback either way, by design. Failures
+/// (connection refused, non-2xx status, timeout — anything
+/// `HttpClientService::send` surfaces) are logged and dropped, never
+/// propagated — a broken webhook endpoint must never take down the
+/// alerting loop, per the issue's explicit instruction.
+pub struct WebhookSink {
+    url: String,
+    http: HttpClientService,
+}
+
+impl WebhookSink {
+    pub fn new(url: impl Into<String>, http: HttpClientService) -> Self {
+        Self {
+            url: url.into(),
+            http,
+        }
+    }
+}
+
+impl NotificationSink for WebhookSink {
+    fn notify(&self, problem: &Problem, rule: &Rule) {
+        let url = self.url.clone();
+        let http = self.http.clone();
+        let payload = match serde_json::to_vec(&WebhookPayload { problem, rule }) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(error = %error, url = %url, "failed to encode webhook payload");
+                return;
+            }
+        };
+
+        tokio::spawn(async move {
+            let request = HttpRequest::post(&url)
+                .with_header("content-type", "application/json")
+                .with_body(payload);
+            if let Err(error) = http.send(request).await {
+                tracing::warn!(error = %error, url = %url, "webhook notification failed");
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use sparrow_core::trigger::{Operator, ProblemStatus, Severity};
+
     use super::*;
 
     fn test_task() -> AlertingTask {
         let pool = PgPool::connect_lazy("postgres://sparrow-tests-unused@127.0.0.1/unused")
             .expect("lazy pool construction should not require a live connection");
-        AlertingTask::new(pool, Duration::from_secs(10))
+        AlertingTask::new(pool, Duration::from_secs(10), Vec::new())
     }
 
     #[tokio::test]
@@ -365,5 +466,111 @@ mod tests {
         let task = test_task();
         // Must not panic when clearing something that was never marked.
         task.clear_condition_since(999, "never-seen-host");
+    }
+
+    fn test_rule() -> Rule {
+        Rule {
+            id: 1,
+            host_id: Some("test-host".to_string()),
+            item_key: "cpu.usage_percent".to_string(),
+            operator: Operator::GreaterThan,
+            threshold: 90.0,
+            severity: Severity::Warning,
+            sustained_for_secs: 0,
+            enabled: true,
+        }
+    }
+
+    fn test_problem() -> Problem {
+        Problem {
+            id: 42,
+            rule_id: 1,
+            host_id: "test-host".to_string(),
+            status: ProblemStatus::Open,
+            opened_at: now_ms(),
+            resolved_at: None,
+            last_value: 95.5,
+        }
+    }
+
+    #[test]
+    fn log_sink_does_not_panic() {
+        // Nothing observable to assert on tracing output here (no
+        // subscriber capture in this test), but this at least confirms
+        // notify() doesn't panic given real Problem/Rule values.
+        LogSink.notify(&test_problem(), &test_rule());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn webhook_sink_posts_the_problem_and_rule_as_json() {
+        use std::sync::Mutex as StdMutex;
+
+        use nest_http_client::HttpClientConfig;
+        use nest_http_serve::{HttpServer, Json, RequestContext, RouteGroup};
+
+        let received: Arc<StdMutex<Option<Vec<u8>>>> = Arc::new(StdMutex::new(None));
+
+        let route_received = Arc::clone(&received);
+        let server = HttpServer::builder()
+            .routes(
+                RouteGroup::new("").post("/webhook", move |ctx: RequestContext| {
+                    let received = Arc::clone(&route_received);
+                    async move {
+                        *received.lock().unwrap() = Some(ctx.body().to_vec());
+                        Json(serde_json::json!({ "ok": true })).into_response()
+                    }
+                }),
+            )
+            .spawn()
+            .await
+            .expect("test server should spawn");
+
+        let http =
+            HttpClientService::new(HttpClientConfig::default()).expect("http client should build");
+        let sink = WebhookSink::new(format!("{}/webhook", server.base_url()), http);
+
+        let rule = test_rule();
+        let problem = test_problem();
+        sink.notify(&problem, &rule);
+
+        // Fire-and-forget: the POST happens in a spawned task, so poll for
+        // it rather than assuming it lands before the next line runs.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let body = loop {
+            if let Some(body) = received.lock().unwrap().clone() {
+                break body;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("webhook POST did not arrive within 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("webhook body should be valid JSON");
+        assert_eq!(value["problem"]["id"], problem.id);
+        assert_eq!(value["problem"]["host_id"], problem.host_id);
+        assert_eq!(value["rule"]["item_key"], rule.item_key);
+        assert_eq!(value["rule"]["operator"], "greater_than");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn webhook_sink_failure_does_not_panic_or_propagate() {
+        use nest_http_client::HttpClientConfig;
+
+        // Nothing listens on this port — the POST will fail to connect.
+        // notify() must swallow that, not panic, matching NotificationSink's
+        // "never propagate" contract.
+        let http =
+            HttpClientService::new(HttpClientConfig::default()).expect("http client should build");
+        let sink = WebhookSink::new("http://127.0.0.1:1", http);
+
+        sink.notify(&test_problem(), &test_rule());
+
+        // Give the spawned task a moment to actually run and fail; the only
+        // thing under test is that this doesn't panic or hang.
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
