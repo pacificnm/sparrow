@@ -9,11 +9,12 @@
 //! cross-cutting model in this crate (`transport::Topics`,
 //! `storage::HostRow`).
 
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 /// A condition to evaluate against a host's latest value for one metric
 /// key.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Rule {
     pub id: i64,
     /// `None` = applies to all hosts.
@@ -33,9 +34,13 @@ pub struct Rule {
 /// `threshold`.
 ///
 /// Stored as `TEXT` (not a native Postgres enum type), hence
-/// `type_name = "text"` rather than naming a `CREATE TYPE`.
-#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
+/// `type_name = "text"` rather than naming a `CREATE TYPE`. `rename_all`
+/// matches on both the `sqlx` (DB) and `serde` (JSON/webhook) sides
+/// deliberately, so the wire and storage representations of this enum never
+/// drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type, Serialize, Deserialize)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum Operator {
     GreaterThan,
     LessThan,
@@ -60,8 +65,9 @@ impl Operator {
 }
 
 /// How urgently a [`Problem`] should be treated.
-#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type, Serialize, Deserialize)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum Severity {
     Info,
     Warning,
@@ -69,8 +75,9 @@ pub enum Severity {
 }
 
 /// Lifecycle state of a [`Problem`].
-#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type, Serialize, Deserialize)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ProblemStatus {
     Open,
     Resolved,
@@ -81,7 +88,7 @@ pub enum ProblemStatus {
 /// any), resolved when the condition stops being true. At most one `Open`
 /// problem exists per `(rule_id, host_id)` pair at a time (enforced by the
 /// `rules`/`problems` migration's partial unique index, issue 8.2).
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Problem {
     pub id: i64,
     pub rule_id: i64,
