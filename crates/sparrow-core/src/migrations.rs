@@ -35,6 +35,40 @@ pub fn all_migrations() -> Vec<Box<dyn Migration>> {
             CREATE INDEX idx_metric_history_host_key_ts ON metric_history (host_id, key, ts DESC);",
             "DROP TABLE metric_history",
         )),
+        Box::new(SqlMigration::new(
+            "003_create_rules",
+            "CREATE TABLE rules (
+                id BIGSERIAL PRIMARY KEY,
+                host_id TEXT REFERENCES hosts(host_id),
+                item_key TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                threshold DOUBLE PRECISION NOT NULL,
+                severity TEXT NOT NULL,
+                sustained_for_secs BIGINT NOT NULL DEFAULT 0,
+                enabled BOOLEAN NOT NULL DEFAULT true
+            )",
+            "DROP TABLE rules",
+        )),
+        Box::new(SqlMigration::new(
+            "004_create_problems",
+            "CREATE TABLE problems (
+                id BIGSERIAL PRIMARY KEY,
+                rule_id BIGINT NOT NULL REFERENCES rules(id),
+                host_id TEXT NOT NULL REFERENCES hosts(host_id),
+                status TEXT NOT NULL,
+                opened_at BIGINT NOT NULL,
+                resolved_at BIGINT,
+                last_value DOUBLE PRECISION NOT NULL
+            );
+            -- Only one OPEN problem per (rule_id, host_id) at a time. Enforced
+            -- at the application level too (Issue 8.3's evaluation loop), but
+            -- keep this index regardless: it turns \"the evaluation loop has a
+            -- bug and double-opens a Problem\" from a silent data-quality issue
+            -- into a loud constraint-violation error during testing.
+            CREATE UNIQUE INDEX idx_one_open_problem_per_rule_host
+                ON problems (rule_id, host_id) WHERE status = 'open';",
+            "DROP TABLE problems",
+        )),
     ]
 }
 
@@ -75,7 +109,15 @@ mod tests {
         let migrations = all_migrations();
         let ids: Vec<_> = migrations.iter().map(|migration| migration.id()).collect();
 
-        assert_eq!(ids, vec!["001_create_hosts", "002_create_metric_history"]);
+        assert_eq!(
+            ids,
+            vec![
+                "001_create_hosts",
+                "002_create_metric_history",
+                "003_create_rules",
+                "004_create_problems",
+            ]
+        );
     }
 
     #[test]
@@ -93,6 +135,24 @@ mod tests {
         assert!(up_sql.contains("tags JSONB NOT NULL DEFAULT '{}'"));
         assert!(up_sql.contains(
             "CREATE INDEX idx_metric_history_host_key_ts ON metric_history (host_id, key, ts DESC)"
+        ));
+    }
+
+    #[test]
+    fn problems_migration_keeps_the_partial_unique_index() {
+        let migrations = all_migrations();
+        let problems = migrations
+            .iter()
+            .find(|migration| migration.id() == "004_create_problems")
+            .expect("problems migration");
+        let up_sql = problems.up_sql();
+
+        // Not "redundant" with Issue 8.3's application-level check — this is
+        // what turns a double-open bug in the evaluation loop into a loud
+        // constraint violation during testing instead of a silent
+        // data-quality issue. Must not get "simplified" away.
+        assert!(up_sql.contains(
+            "CREATE UNIQUE INDEX idx_one_open_problem_per_rule_host\n                ON problems (rule_id, host_id) WHERE status = 'open';"
         ));
     }
 
@@ -124,7 +184,12 @@ mod tests {
 
         assert_eq!(
             applied,
-            vec!["001_create_hosts", "002_create_metric_history"]
+            vec![
+                "001_create_hosts",
+                "002_create_metric_history",
+                "003_create_rules",
+                "004_create_problems",
+            ]
         );
 
         let host_columns: i64 =
@@ -137,9 +202,75 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("metric column count");
+        let rules_columns: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'rules'")
+                .fetch_one(&pool)
+                .await
+                .expect("rules column count");
+        let problems_columns: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'problems'")
+                .fetch_one(&pool)
+                .await
+                .expect("problems column count");
 
         assert_eq!(host_columns, 4);
         assert_eq!(metric_columns, 8);
+        assert_eq!(rules_columns, 8);
+        assert_eq!(problems_columns, 7);
+
+        // The partial unique index this migration exists for — confirm it's
+        // actually created in Postgres, not just present in the SQL string.
+        let index_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_one_open_problem_per_rule_host')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("index existence check");
+        assert!(
+            index_exists,
+            "idx_one_open_problem_per_rule_host should exist after migrating"
+        );
+
+        // The index must actually enforce one-open-problem-per-rule-host —
+        // insert a rule, open two problems for the same (rule_id, host_id)
+        // pair, and confirm the second one is rejected, not silently
+        // allowed. This is the actual behavior the migration exists for.
+        crate::storage::HostRegistry::new(pool.clone())
+            .upsert_on_register("problems-index-test-host", "test-host")
+            .await
+            .expect("seed host for the FK reference");
+        let rule_id: i64 = sqlx::query_scalar(
+            "INSERT INTO rules (host_id, item_key, operator, threshold, severity)
+             VALUES ($1, 'cpu.usage_percent', 'greater_than', 90.0, 'warning')
+             RETURNING id",
+        )
+        .bind("problems-index-test-host")
+        .fetch_one(&pool)
+        .await
+        .expect("insert rule");
+
+        sqlx::query(
+            "INSERT INTO problems (rule_id, host_id, status, opened_at, last_value)
+             VALUES ($1, $2, 'open', 0, 95.0)",
+        )
+        .bind(rule_id)
+        .bind("problems-index-test-host")
+        .execute(&pool)
+        .await
+        .expect("first open problem should insert cleanly");
+
+        let second_insert = sqlx::query(
+            "INSERT INTO problems (rule_id, host_id, status, opened_at, last_value)
+             VALUES ($1, $2, 'open', 1, 96.0)",
+        )
+        .bind(rule_id)
+        .bind("problems-index-test-host")
+        .execute(&pool)
+        .await;
+        assert!(
+            second_insert.is_err(),
+            "a second OPEN problem for the same (rule_id, host_id) must be rejected by the partial unique index"
+        );
 
         drop(built);
     }
