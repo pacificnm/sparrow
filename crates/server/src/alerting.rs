@@ -573,4 +573,271 @@ mod tests {
         // thing under test is that this doesn't panic or hang.
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // --- Docker-backed tests below: evaluate_rule_for_host's four quadrants,
+    // sustained-duration, and an end-to-end evaluate_once() pass against a
+    // real testcontainers Postgres. Issue 8.5's acceptance criterion is
+    // `cargo test -p sparrow-server alerting::` passing with Docker running.
+
+    use nest_data::DataModule;
+    use nest_data_postgres::{PostgresConfig, PostgresDataModule};
+    use sparrow_core::storage::HostRegistry;
+    use testcontainers_modules::postgres::Postgres as PostgresImage;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::ContainerAsync;
+
+    /// Holds a running Postgres container (with Sparrow's migrations already
+    /// applied) alive for the test's duration. Same recipe as
+    /// `sparrow-core/src/storage.rs`'s own test module (duplicated, not
+    /// imported — that one is private to `sparrow-core`'s tests).
+    struct TestDb {
+        _container: ContainerAsync<PostgresImage>,
+        pool: PgPool,
+    }
+
+    async fn start_postgres_with_schema() -> TestDb {
+        let container = PostgresImage::default()
+            .start()
+            .await
+            .expect("failed to start postgres testcontainer");
+        let host = container.get_host().await.expect("container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("container port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+        nest_core::AppBuilder::new()
+            .module(DataModule)
+            .module(
+                PostgresDataModule::new(PostgresConfig::new(url.clone()))
+                    .with_migrations(sparrow_core::migrations::all_migrations()),
+            )
+            .build()
+            .expect("app with postgres migrations");
+
+        let pool = PgPool::connect(&url).await.expect("fresh postgres pool");
+
+        TestDb {
+            _container: container,
+            pool,
+        }
+    }
+
+    /// Registers `host_id` and inserts a matching `rules` row (both FK
+    /// targets `problems`/`rules` need), returning a `Rule` whose `id`
+    /// matches the real inserted row — `evaluate_rule_for_host` opens/
+    /// resolves real `problems` rows referencing this id, so it can't be a
+    /// made-up value like the non-Docker unit tests above use.
+    async fn seed_rule(pool: &PgPool, host_id: &str, sustained_for_secs: i64) -> Rule {
+        HostRegistry::new(pool.clone())
+            .upsert_on_register(host_id, "test-host")
+            .await
+            .expect("seed host for the FK reference");
+
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO rules (host_id, item_key, operator, threshold, severity, sustained_for_secs)
+             VALUES ($1, 'cpu.usage_percent', 'greater_than', 90.0, 'warning', $2)
+             RETURNING id",
+        )
+        .bind(host_id)
+        .bind(sustained_for_secs)
+        .fetch_one(pool)
+        .await
+        .expect("insert rule");
+
+        Rule {
+            id,
+            host_id: Some(host_id.to_string()),
+            item_key: "cpu.usage_percent".to_string(),
+            operator: Operator::GreaterThan,
+            threshold: 90.0,
+            severity: Severity::Warning,
+            sustained_for_secs,
+            enabled: true,
+        }
+    }
+
+    async fn open_problem_count(pool: &PgPool, rule_id: i64, host_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM problems WHERE rule_id = $1 AND host_id = $2 AND status = 'open'",
+        )
+        .bind(rule_id)
+        .bind(host_id)
+        .fetch_one(pool)
+        .await
+        .expect("open problem count")
+    }
+
+    fn task_for(pool: PgPool) -> AlertingTask {
+        AlertingTask::new(pool, Duration::from_secs(10), Vec::new())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evaluate_rule_for_host_opens_a_problem_when_condition_becomes_true() {
+        let db = start_postgres_with_schema().await;
+        let rule = seed_rule(&db.pool, "quadrant-open", 0).await;
+        let task = task_for(db.pool.clone());
+
+        task.evaluate_rule_for_host(&rule, "quadrant-open", 95.0)
+            .await
+            .expect("evaluate_rule_for_host should succeed");
+
+        let problem = fetch_open_problem(&db.pool, rule.id, "quadrant-open")
+            .await
+            .expect("fetch_open_problem should succeed")
+            .expect("a problem should have opened");
+        assert_eq!(problem.last_value, 95.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evaluate_rule_for_host_updates_last_value_without_opening_a_duplicate() {
+        let db = start_postgres_with_schema().await;
+        let rule = seed_rule(&db.pool, "quadrant-update", 0).await;
+        let task = task_for(db.pool.clone());
+
+        task.evaluate_rule_for_host(&rule, "quadrant-update", 95.0)
+            .await
+            .expect("first evaluation should open a problem");
+        task.evaluate_rule_for_host(&rule, "quadrant-update", 97.0)
+            .await
+            .expect("second evaluation should update, not duplicate");
+
+        assert_eq!(
+            open_problem_count(&db.pool, rule.id, "quadrant-update").await,
+            1,
+            "a second true evaluation must not open a duplicate problem — the \
+             partial unique index from Issue 8.2 backs this up"
+        );
+        let problem = fetch_open_problem(&db.pool, rule.id, "quadrant-update")
+            .await
+            .expect("fetch_open_problem should succeed")
+            .expect("the problem should still be open");
+        assert_eq!(problem.last_value, 97.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evaluate_rule_for_host_resolves_an_open_problem_when_condition_goes_false() {
+        let db = start_postgres_with_schema().await;
+        let rule = seed_rule(&db.pool, "quadrant-resolve", 0).await;
+        let task = task_for(db.pool.clone());
+
+        task.evaluate_rule_for_host(&rule, "quadrant-resolve", 95.0)
+            .await
+            .expect("first evaluation should open a problem");
+        task.evaluate_rule_for_host(&rule, "quadrant-resolve", 10.0)
+            .await
+            .expect("second evaluation should resolve the open problem");
+
+        assert!(
+            fetch_open_problem(&db.pool, rule.id, "quadrant-resolve")
+                .await
+                .expect("fetch_open_problem should succeed")
+                .is_none(),
+            "the problem should no longer be open"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM problems WHERE rule_id = $1 AND host_id = $2")
+                .bind(rule.id)
+                .bind("quadrant-resolve")
+                .fetch_one(&db.pool)
+                .await
+                .expect("problem row should still exist, now resolved");
+        assert_eq!(status, "resolved");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evaluate_rule_for_host_is_a_no_op_when_condition_false_and_nothing_open() {
+        let db = start_postgres_with_schema().await;
+        let rule = seed_rule(&db.pool, "quadrant-noop", 0).await;
+        let task = task_for(db.pool.clone());
+
+        task.evaluate_rule_for_host(&rule, "quadrant-noop", 10.0)
+            .await
+            .expect("evaluate_rule_for_host should succeed");
+
+        assert_eq!(
+            open_problem_count(&db.pool, rule.id, "quadrant-noop").await,
+            0,
+            "a never-true condition must never open a problem"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evaluate_rule_for_host_waits_out_the_sustain_window_before_opening() {
+        let db = start_postgres_with_schema().await;
+        let rule = seed_rule(&db.pool, "quadrant-sustain", 1).await;
+        let task = task_for(db.pool.clone());
+
+        task.evaluate_rule_for_host(&rule, "quadrant-sustain", 95.0)
+            .await
+            .expect("first evaluation should succeed");
+        assert_eq!(
+            open_problem_count(&db.pool, rule.id, "quadrant-sustain").await,
+            0,
+            "condition true for less than the sustain window must not open a problem yet"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        task.evaluate_rule_for_host(&rule, "quadrant-sustain", 95.0)
+            .await
+            .expect("second evaluation, past the sustain window, should succeed");
+        assert_eq!(
+            open_problem_count(&db.pool, rule.id, "quadrant-sustain").await,
+            1,
+            "condition true for longer than the sustain window must open a problem"
+        );
+    }
+
+    /// End-to-end acceptance case: seed a rule, drive a value past threshold
+    /// by inserting directly into `metric_history` (no need for a real
+    /// loaded host), confirm a Problem opens and later resolves when the
+    /// value drops back — via the real `evaluate_once` entry point
+    /// (`Task::run` calls exactly this each tick), not `evaluate_rule_for_host`
+    /// directly like the quadrant tests above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evaluate_once_drives_the_full_problem_lifecycle_from_metric_history() {
+        let db = start_postgres_with_schema().await;
+        let host_id = "e2e-host";
+        let rule = seed_rule(&db.pool, host_id, 0).await;
+        let task = task_for(db.pool.clone());
+
+        insert_metric(&db.pool, host_id, "cpu.usage_percent", 95.0, 1).await;
+        task.evaluate_once()
+            .await
+            .expect("first pass should succeed");
+        assert!(
+            fetch_open_problem(&db.pool, rule.id, host_id)
+                .await
+                .expect("fetch_open_problem should succeed")
+                .is_some(),
+            "a problem should have opened once the metric crossed the threshold"
+        );
+
+        insert_metric(&db.pool, host_id, "cpu.usage_percent", 10.0, 2).await;
+        task.evaluate_once()
+            .await
+            .expect("second pass should succeed");
+        assert!(
+            fetch_open_problem(&db.pool, rule.id, host_id)
+                .await
+                .expect("fetch_open_problem should succeed")
+                .is_none(),
+            "the problem should resolve once the metric drops back below threshold"
+        );
+    }
+
+    async fn insert_metric(pool: &PgPool, host_id: &str, key: &str, value: f64, ts: i64) {
+        sqlx::query(
+            "INSERT INTO metric_history (host_id, collector, key, value, value_type, ts)
+             VALUES ($1, 'test-collector', $2, $3, 'float', $4)",
+        )
+        .bind(host_id)
+        .bind(key)
+        .bind(value.to_string())
+        .bind(ts)
+        .execute(pool)
+        .await
+        .expect("insert metric_history row");
+    }
 }
