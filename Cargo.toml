@@ -11,6 +11,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
+nest-ai = { path = "../../core/crates/nest-ai" }
 nest-cli = { path = "../../core/crates/nest-cli" }
 nest-core = { path = "../../core/crates/nest-core" }
 nest-data = { path = "../../core/crates/nest-data" }

@@ -75,7 +75,11 @@ pub struct OllamaEmbedder {
 }
 
 impl OllamaEmbedder {
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>, http: HttpClientService) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        http: HttpClientService,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             model: model.into(),
