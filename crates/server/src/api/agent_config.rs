@@ -295,4 +295,386 @@ mod tests {
             "a PUT must fully replace the stored override, not merge with the previous one"
         );
     }
+
+    // --- Milestone-closing end-to-end tests (Issue 9.4): a real Postgres +
+    // Mosquitto + HTTP server + real sparrow-agent components (the same
+    // ones main.rs wires up), driven through the actual PUT endpoint —
+    // not by publishing to MQTT directly like config_reload_live.rs's own
+    // (issue #15) test does. Case (c) below is the one the phase-9 spec's
+    // "do not skip" list calls out explicitly: it's the only test that
+    // actually proves retained-message semantics work, not just live
+    // pub/sub.
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures_util::StreamExt;
+    use nest_http_serve::HttpServer;
+    use nest_task::TaskManager;
+    use nest_task_runtime::{TaskManagerConfig, TaskManagerService};
+    use sparrow_agent::config::AgentConfig;
+    use sparrow_agent::config_reload::ConfigReload;
+    use sparrow_agent::publisher::Publisher;
+    use sparrow_agent::scheduler::BatchSink;
+    use sparrow_core::transport::DataBatch;
+    use testcontainers::core::{IntoContainerPort, WaitFor};
+    use testcontainers::{ContainerAsync as MosquittoContainer, GenericImage};
+
+    /// Holds a running Mosquitto container alive for the test's duration.
+    /// Same recipe as `crates/agent/tests/support/mod.rs` and
+    /// `crates/server/tests/support/mod.rs`'s own `start_broker` — every
+    /// `tests/*.rs`/`#[cfg(test)] mod` compiles separately, so this can't
+    /// be shared, only duplicated.
+    struct TestBroker {
+        #[allow(dead_code)]
+        container: MosquittoContainer<GenericImage>,
+        host: String,
+        port: u16,
+    }
+
+    async fn start_broker() -> TestBroker {
+        let container = GenericImage::new("eclipse-mosquitto", "2")
+            .with_exposed_port(1883.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("running"))
+            .start()
+            .await
+            .expect("failed to start mosquitto testcontainer");
+        let host = container
+            .get_host()
+            .await
+            .expect("container host")
+            .to_string();
+        let port = container
+            .get_host_port_ipv4(1883)
+            .await
+            .expect("container port");
+        TestBroker {
+            container,
+            host,
+            port,
+        }
+    }
+
+    /// Builds a real `AgentConfig` with every collector's interval
+    /// overridden to 1s, so the test doesn't wait out `disk`'s real 60s
+    /// default — same reasoning as `crates/agent/tests/support/mod.rs`'s
+    /// `test_agent_config`, duplicated rather than imported (private to
+    /// that crate's own tests).
+    fn e2e_agent_config(host_id: &str, broker: &TestBroker) -> AgentConfig {
+        AgentConfig {
+            host_id: host_id.to_string(),
+            broker_host: broker.host.clone(),
+            broker_port: broker.port,
+            collector_intervals: BTreeMap::from([
+                ("cpu".to_string(), 1),
+                ("memory".to_string(), 1),
+                ("disk".to_string(), 1),
+            ]),
+            disabled_collectors: Vec::new(),
+        }
+    }
+
+    fn e2e_task_manager() -> TaskManagerService {
+        let app = nest_core::AppBuilder::new()
+            .build()
+            .expect("empty app context")
+            .context;
+        let manager = TaskManagerService::new(
+            tokio::runtime::Handle::current(),
+            TaskManagerConfig::default(),
+        );
+        manager.set_context(app);
+        manager
+    }
+
+    /// Polls `predicate` until it's `true` or `timeout` elapses. Duplicated
+    /// from `crates/agent/tests/support/mod.rs`'s `wait_until` (private to
+    /// that crate's tests).
+    async fn wait_until(
+        timeout: Duration,
+        poll_interval: Duration,
+        mut predicate: impl FnMut() -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if predicate() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_agent_config_is_retained_and_a_running_agent_picks_it_up() {
+        let db = start_postgres_with_schema().await;
+        let broker = start_broker().await;
+        let host_id = "agent-config-e2e-running-host";
+        HostRegistry::new(db.pool.clone())
+            .upsert_on_register(host_id, "test-host")
+            .await
+            .expect("seed host for the FK reference");
+
+        let server_mqtt =
+            MqttClient::connect(&MqttConfig::new(&broker.host, broker.port, "server"))
+                .await
+                .expect("server mqtt client should connect");
+        let http_server = HttpServer::builder()
+            .routes(routes(db.pool.clone(), server_mqtt))
+            .spawn()
+            .await
+            .expect("http server should spawn");
+
+        // The already-running agent: ConfigReload spawns its local
+        // (nothing-disabled) collector set itself at startup, same as
+        // main.rs's real bootstrap.
+        let agent_config = e2e_agent_config(host_id, &broker);
+        let agent_client = MqttClient::connect(&MqttConfig::new(
+            &agent_config.broker_host,
+            agent_config.broker_port,
+            &agent_config.host_id,
+        ))
+        .await
+        .expect("agent mqtt client should connect");
+        let sink: Arc<dyn BatchSink> =
+            Arc::new(Publisher::new(agent_client.clone(), &agent_config));
+        let manager = e2e_task_manager();
+        manager
+            .spawn(ConfigReload::new(
+                agent_client.clone(),
+                &agent_config,
+                Arc::clone(&sink),
+                manager.clone(),
+            ))
+            .await
+            .expect("config_reload should spawn");
+
+        // Observes Topics::config(host_id) directly — confirms (a) "the
+        // retained message lands on the topic", independent of whether the
+        // agent reacts correctly to it.
+        let config_observer = MqttClient::connect(&MqttConfig::new(
+            &broker.host,
+            broker.port,
+            "config-topic-observer",
+        ))
+        .await
+        .expect("config observer should connect");
+        let config_stream = config_observer
+            .subscribe(&Topics::config(host_id), MqttQos::AtLeastOnce)
+            .await
+            .expect("config observer should subscribe");
+        tokio::pin!(config_stream);
+
+        // Observes Topics::data(host_id) — confirms (b): the running
+        // agent's own collector set actually reacts.
+        let data_observer = MqttClient::connect(&MqttConfig::new(
+            &broker.host,
+            broker.port,
+            "data-topic-observer",
+        ))
+        .await
+        .expect("data observer should connect");
+        let data_stream = data_observer
+            .subscribe(&Topics::data(host_id), MqttQos::AtLeastOnce)
+            .await
+            .expect("data observer should subscribe");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let cpu_seen = Arc::new(AtomicBool::new(false));
+        let disk_seen = Arc::new(AtomicBool::new(false));
+        {
+            let cpu_seen = Arc::clone(&cpu_seen);
+            let disk_seen = Arc::clone(&disk_seen);
+            tokio::spawn(async move {
+                tokio::pin!(data_stream);
+                while let Some(message) = data_stream.next().await {
+                    if let Ok(batch) = DataBatch::from_payload(&message.payload) {
+                        match batch.collector.as_str() {
+                            "cpu" => cpu_seen.store(true, Ordering::SeqCst),
+                            "disk" => disk_seen.store(true, Ordering::SeqCst),
+                            _ => {}
+                        }
+                    }
+                }
+            });
+        }
+
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(200), || {
+                cpu_seen.load(Ordering::SeqCst) && disk_seen.load(Ordering::SeqCst)
+            })
+            .await,
+            "expected cpu and disk data within 10s of the baseline (nothing-disabled) config"
+        );
+
+        // The actual thing under test: PUT through the real HTTP endpoint,
+        // not a raw MQTT publish.
+        let http_client = reqwest::Client::new();
+        let response = http_client
+            .put(format!(
+                "{}/api/hosts/{host_id}/config",
+                http_server.base_url()
+            ))
+            .json(&AgentConfigOverride {
+                disabled_collectors: vec!["disk".to_string()],
+                collector_intervals: BTreeMap::new(),
+            })
+            .send()
+            .await
+            .expect("PUT should succeed");
+        assert!(response.status().is_success(), "PUT should return 2xx");
+        let applied: AgentConfigOverride = response.json().await.expect("PUT body should be JSON");
+        assert_eq!(applied.disabled_collectors, vec!["disk".to_string()]);
+
+        // (a) the retained message lands on the topic.
+        let landed = tokio::time::timeout(Duration::from_secs(5), config_stream.next())
+            .await
+            .expect("config message should arrive within 5s")
+            .expect("config stream should not end");
+        let landed_override = AgentConfigOverride::from_payload(&landed.payload)
+            .expect("retained message should decode as AgentConfigOverride");
+        assert_eq!(
+            landed_override.disabled_collectors,
+            vec!["disk".to_string()]
+        );
+
+        // (b) the running agent picks it up within one cancel-poll cycle.
+        cpu_seen.store(false, Ordering::SeqCst);
+        disk_seen.store(false, Ordering::SeqCst);
+        assert!(
+            wait_until(Duration::from_secs(5), Duration::from_millis(200), || {
+                cpu_seen.load(Ordering::SeqCst)
+            })
+            .await,
+            "cpu should keep publishing after disk is disabled"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !disk_seen.load(Ordering::SeqCst),
+            "the running agent should have stopped publishing disk.* items"
+        );
+
+        http_server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_agent_config_reaches_a_freshly_connecting_agent() {
+        // Case (c) from the phase-9 spec's "do not skip" list: the only
+        // test that actually proves retained-message semantics work, not
+        // just live pub/sub. A PUT happens *before* any agent for this
+        // host exists; the agent that starts afterward must still come up
+        // with disk disabled from the start, purely from the retained
+        // message it receives on its very first subscribe.
+        let db = start_postgres_with_schema().await;
+        let broker = start_broker().await;
+        let host_id = "agent-config-e2e-fresh-host";
+        HostRegistry::new(db.pool.clone())
+            .upsert_on_register(host_id, "test-host")
+            .await
+            .expect("seed host for the FK reference");
+
+        let server_mqtt =
+            MqttClient::connect(&MqttConfig::new(&broker.host, broker.port, "server"))
+                .await
+                .expect("server mqtt client should connect");
+        let http_server = HttpServer::builder()
+            .routes(routes(db.pool.clone(), server_mqtt))
+            .spawn()
+            .await
+            .expect("http server should spawn");
+
+        let http_client = reqwest::Client::new();
+        let response = http_client
+            .put(format!(
+                "{}/api/hosts/{host_id}/config",
+                http_server.base_url()
+            ))
+            .json(&AgentConfigOverride {
+                disabled_collectors: vec!["disk".to_string()],
+                collector_intervals: BTreeMap::new(),
+            })
+            .send()
+            .await
+            .expect("PUT should succeed");
+        assert!(response.status().is_success(), "PUT should return 2xx");
+
+        // Only now does the agent for this host come into existence — same
+        // bootstrap as main.rs: ConfigReload spawns its (plain,
+        // nothing-disabled) local-defaults collector set at startup, then
+        // immediately reconciles against the already-retained override on
+        // its very first subscribe.
+        let agent_config = e2e_agent_config(host_id, &broker);
+        let agent_client = MqttClient::connect(&MqttConfig::new(
+            &agent_config.broker_host,
+            agent_config.broker_port,
+            &agent_config.host_id,
+        ))
+        .await
+        .expect("agent mqtt client should connect");
+        let sink: Arc<dyn BatchSink> =
+            Arc::new(Publisher::new(agent_client.clone(), &agent_config));
+        let manager = e2e_task_manager();
+        manager
+            .spawn(ConfigReload::new(
+                agent_client.clone(),
+                &agent_config,
+                Arc::clone(&sink),
+                manager.clone(),
+            ))
+            .await
+            .expect("config_reload should spawn");
+
+        let data_observer = MqttClient::connect(&MqttConfig::new(
+            &broker.host,
+            broker.port,
+            "fresh-agent-data-observer",
+        ))
+        .await
+        .expect("data observer should connect");
+        let data_stream = data_observer
+            .subscribe(&Topics::data(host_id), MqttQos::AtLeastOnce)
+            .await
+            .expect("data observer should subscribe");
+
+        let cpu_seen = Arc::new(AtomicBool::new(false));
+        let disk_seen = Arc::new(AtomicBool::new(false));
+        {
+            let cpu_seen = Arc::clone(&cpu_seen);
+            let disk_seen = Arc::clone(&disk_seen);
+            tokio::spawn(async move {
+                tokio::pin!(data_stream);
+                while let Some(message) = data_stream.next().await {
+                    if let Ok(batch) = DataBatch::from_payload(&message.payload) {
+                        match batch.collector.as_str() {
+                            "cpu" => cpu_seen.store(true, Ordering::SeqCst),
+                            "disk" => disk_seen.store(true, Ordering::SeqCst),
+                            _ => {}
+                        }
+                    }
+                }
+            });
+        }
+
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(200), || {
+                cpu_seen.load(Ordering::SeqCst)
+            })
+            .await,
+            "cpu should still publish — only disk was disabled"
+        );
+        // Give disk every opportunity to have published at least once if
+        // the retained-message reconciliation didn't actually take effect
+        // before its first tick.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !disk_seen.load(Ordering::SeqCst),
+            "a freshly connecting agent must come up with disk already disabled, proving the \
+             retained config was applied from its very first subscribe — not observed live"
+        );
+
+        http_server.shutdown().await;
+    }
 }
