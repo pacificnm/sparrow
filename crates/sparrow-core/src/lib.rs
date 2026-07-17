@@ -1,3 +1,4 @@
+pub mod analyst;
 pub mod collector;
 pub mod collectors;
 pub mod config;
