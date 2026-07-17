@@ -24,6 +24,19 @@ use crate::scheduler::{BatchSink, CollectorTask};
 /// shape doesn't fit here — only the ~1s responsiveness bound is shared.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long [`Task::run`] waits, right after subscribing, for an
+/// already-retained message before falling back to `local_defaults`.
+///
+/// This exists to close a narrow but real race: `CollectorTask` fires its
+/// first collection *immediately* on spawn, not after waiting out an
+/// interval (see `interval_task`'s own tests). If `local_defaults` were
+/// applied first and only corrected once the retained message arrived, a
+/// collector the retained override wants disabled could publish at least
+/// once before the correction landed. Waiting this long for a possibly-
+/// already-retained message first means that correction, when one exists,
+/// is applied *before* anything is ever spawned — not after.
+const RETAINED_MESSAGE_GRACE: Duration = Duration::from_millis(500);
+
 /// One collector's currently-running `CollectorTask`, tracked so a later
 /// config change can be diffed against it.
 struct RunningCollector {
@@ -31,10 +44,16 @@ struct RunningCollector {
     interval_secs: u64,
 }
 
-/// Subscribes once (at [`Task::run`] start) to `Topics::config(host_id)` — a
-/// **retained** topic, so a message arrives immediately even if it was
-/// published while this agent was offline — and applies each
-/// [`AgentConfigOverride`] it receives to the live `CollectorTask` set:
+/// Owns the *entire* `CollectorTask` lifecycle — both the initial spawn and
+/// every later reconcile against `Topics::config(host_id)` — a **retained**
+/// topic, so a message arrives immediately even if it was published while
+/// this agent was offline. [`Task::run`] subscribes first and waits a short
+/// grace period ([`RETAINED_MESSAGE_GRACE`]) for an already-retained
+/// message before falling back to `config`'s own local
+/// `disabled_collectors`/`collector_intervals` — see that constant's doc
+/// comment for why the order matters. Each [`AgentConfigOverride`] it
+/// applies (whichever became the initial one, or a real one received
+/// later) is reconciled against the live `CollectorTask` set the same way:
 ///
 /// - Collectors newly in `disabled_collectors` are cancelled.
 /// - Collectors newly absent from `disabled_collectors` are started.
@@ -45,8 +64,21 @@ struct RunningCollector {
 ///   alone, including whatever persistent state their `Collector` instance
 ///   holds (e.g. `cpu`'s `sysinfo::System`).
 ///
+/// **Why the initial spawn has to happen here, not in `main.rs`:** `running`
+/// (this struct's bookkeeping of what's actually alive) only ever learns
+/// about a `CollectorTask` if *this* struct is the one that spawned it. An
+/// earlier version had `main.rs` spawn the initial set directly and
+/// `ConfigReload` separately reconcile later arrivals — which meant the
+/// first real retained message could never cancel anything from that
+/// initial set (it wasn't in `running`) and would spawn *duplicate* tasks
+/// for anything still desired (this struct had no record they already
+/// existed). A milestone-9 end-to-end test (a fresh agent picking up an
+/// already-retained config from its very first subscribe) caught this —
+/// covered by `crates/server`'s
+/// `put_agent_config_reaches_a_freshly_connecting_agent`.
+///
 /// Dynamically-started collectors are spawned through the same
-/// [`TaskManagerService`] `main.rs` uses for the initial task set (not a raw
+/// [`TaskManagerService`] `main.rs` uses for its own tasks (not a raw
 /// `tokio::spawn`) — that's what gives them a real `TaskContext` (built from
 /// the app's actual `Arc<AppContext>`, which isn't otherwise reachable from
 /// here) and makes them show up in the same registry/cancellation path as
@@ -54,15 +86,21 @@ struct RunningCollector {
 pub struct ConfigReload {
     client: MqttClient,
     host_id: String,
+    /// `config`'s own `disabled_collectors`/`collector_intervals` — the
+    /// fallback `Task::run` applies if no retained message shows up within
+    /// `RETAINED_MESSAGE_GRACE` of subscribing (i.e. nothing has ever been
+    /// pushed for this host).
+    local_defaults: AgentConfigOverride,
     sink: Arc<dyn BatchSink>,
     manager: TaskManagerService,
     running: Mutex<HashMap<&'static str, RunningCollector>>,
 }
 
 impl ConfigReload {
-    /// Creates a task that reconciles the running `CollectorTask` set
-    /// against `Topics::config(config.host_id)`, publishing batches through
-    /// `sink` and spawning each replacement `CollectorTask` through `manager`.
+    /// Creates a task that spawns `config`'s local-defaults `CollectorTask`
+    /// set at startup, then reconciles it against `Topics::config(config.host_id)`
+    /// as later overrides arrive — publishing batches through `sink` and
+    /// spawning every replacement `CollectorTask` through `manager`.
     pub fn new(
         client: MqttClient,
         config: &AgentConfig,
@@ -72,6 +110,10 @@ impl ConfigReload {
         Self {
             client,
             host_id: config.host_id.clone(),
+            local_defaults: AgentConfigOverride {
+                disabled_collectors: config.disabled_collectors.clone(),
+                collector_intervals: config.collector_intervals.clone(),
+            },
             sink,
             manager,
             running: Mutex::new(HashMap::new()),
@@ -168,6 +210,28 @@ impl Task for ConfigReload {
         // non-Unpin async block), but `StreamExt::next()` requires `Unpin` —
         // pin it in place here rather than boxing.
         tokio::pin!(messages);
+
+        // Give a possibly-already-retained message (published while this
+        // agent was offline, or before it ever ran) a short window to
+        // arrive before committing to local_defaults — see
+        // RETAINED_MESSAGE_GRACE's doc comment for why order matters here.
+        match tokio::time::timeout(RETAINED_MESSAGE_GRACE, messages.next()).await {
+            Ok(Some(message)) => match AgentConfigOverride::from_payload(&message.payload) {
+                Ok(override_) => self.apply(&override_).await,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to parse retained config message; falling back to local defaults"
+                    );
+                    self.apply(&self.local_defaults).await;
+                }
+            },
+            // Subscription stream ended (client dropped) before anything arrived.
+            Ok(None) => return Ok(()),
+            // No retained message within the grace period — nothing has
+            // ever been pushed for this host; start from local defaults.
+            Err(_timeout) => self.apply(&self.local_defaults).await,
+        }
 
         loop {
             if ctx.cancel_token().is_cancelled() {

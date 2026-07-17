@@ -23,6 +23,7 @@ nest-core = { workspace = true }
 nest-data = { workspace = true }
 nest-data-postgres = { workspace = true }
 nest-task-runtime = { workspace = true }
+sparrow-agent = { path = "../agent" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 testcontainers = "=0.23.3"
 testcontainers-modules = { version = "=0.11.6", features = ["postgres"] }

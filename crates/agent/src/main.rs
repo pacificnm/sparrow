@@ -1,7 +1,6 @@
 #![allow(clippy::result_large_err)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::{ArgMatches, Command};
@@ -16,8 +15,7 @@ use sparrow_agent::config::AgentConfig;
 use sparrow_agent::config_reload::ConfigReload;
 use sparrow_agent::heartbeat::HeartbeatTask;
 use sparrow_agent::publisher::Publisher;
-use sparrow_agent::scheduler::{BatchSink, CollectorTask};
-use sparrow_core::collectors::default_collectors;
+use sparrow_agent::scheduler::BatchSink;
 use sparrow_core::transport::{RegisterMessage, Topics};
 
 /// Persistent tasks — one per enabled collector (up to 3: cpu/memory/disk),
@@ -73,33 +71,16 @@ impl AsyncCliCommand for RunCommand {
         let sink: Arc<dyn BatchSink> = Arc::new(Publisher::new(client.clone(), &agent_config));
         let manager = ctx.service::<TaskManagerService>()?.clone();
 
-        let mut spawned = 0usize;
-        for collector in default_collectors() {
-            let name = collector.name();
-            if agent_config
-                .disabled_collectors
-                .iter()
-                .any(|disabled| disabled == name)
-            {
-                continue;
-            }
-
-            let interval = agent_config
-                .collector_intervals
-                .get(name)
-                .copied()
-                .unwrap_or_else(|| collector.default_interval_secs());
-
-            let task =
-                CollectorTask::new(collector, Duration::from_secs(interval), Arc::clone(&sink));
-            manager.spawn(task).await?;
-            spawned += 1;
-        }
-
         manager
             .spawn(HeartbeatTask::new(client.clone(), &agent_config))
             .await?;
 
+        // ConfigReload spawns the local-defaults CollectorTask set itself
+        // (at Task::run start, before subscribing) — not a separate loop
+        // here — so its own bookkeeping of what's running stays accurate
+        // from the very first retained config message onward. See
+        // ConfigReload's doc comment for why splitting this across main.rs
+        // and ConfigReload used to be a real bug.
         manager
             .spawn(ConfigReload::new(
                 client.clone(),
@@ -111,8 +92,7 @@ impl AsyncCliCommand for RunCommand {
 
         tracing::info!(
             host_id = %agent_config.host_id,
-            collectors = spawned,
-            "sparrow-agent running: {spawned} collector(s), heartbeat, config_reload"
+            "sparrow-agent running: collectors (via config_reload), heartbeat, config_reload"
         );
 
         wait_for_shutdown_signal().await;

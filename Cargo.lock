@@ -2462,6 +2462,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sparrow-agent",
  "sparrow-core",
  "sqlx",
  "testcontainers",
