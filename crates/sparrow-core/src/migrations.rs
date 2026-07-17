@@ -69,6 +69,16 @@ pub fn all_migrations() -> Vec<Box<dyn Migration>> {
                 ON problems (rule_id, host_id) WHERE status = 'open';",
             "DROP TABLE problems",
         )),
+        Box::new(SqlMigration::new(
+            "005_create_agent_configs",
+            "CREATE TABLE agent_configs (
+                host_id TEXT PRIMARY KEY REFERENCES hosts(host_id),
+                disabled_collectors JSONB NOT NULL DEFAULT '[]',
+                collector_intervals JSONB NOT NULL DEFAULT '{}',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "DROP TABLE agent_configs",
+        )),
     ]
 }
 
@@ -116,8 +126,27 @@ mod tests {
                 "002_create_metric_history",
                 "003_create_rules",
                 "004_create_problems",
+                "005_create_agent_configs",
             ]
         );
+    }
+
+    #[test]
+    fn agent_configs_migration_has_the_expected_defaults() {
+        let migrations = all_migrations();
+        let agent_configs = migrations
+            .iter()
+            .find(|migration| migration.id() == "005_create_agent_configs")
+            .expect("agent_configs migration");
+        let up_sql = agent_configs.up_sql();
+
+        // A host with no row must read back as "everything enabled, default
+        // intervals" (Issue 9.1's explicit instruction) — these column
+        // defaults are what make that true without the read path (Issue
+        // 9.3) needing a missing-row special case.
+        assert!(up_sql.contains("disabled_collectors JSONB NOT NULL DEFAULT '[]'"));
+        assert!(up_sql.contains("collector_intervals JSONB NOT NULL DEFAULT '{}'"));
+        assert!(up_sql.contains("host_id TEXT PRIMARY KEY REFERENCES hosts(host_id)"));
     }
 
     #[test]
@@ -189,6 +218,7 @@ mod tests {
                 "002_create_metric_history",
                 "003_create_rules",
                 "004_create_problems",
+                "005_create_agent_configs",
             ]
         );
 
@@ -212,11 +242,17 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("problems column count");
+        let agent_configs_columns: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'agent_configs'")
+                .fetch_one(&pool)
+                .await
+                .expect("agent_configs column count");
 
         assert_eq!(host_columns, 4);
         assert_eq!(metric_columns, 8);
         assert_eq!(rules_columns, 8);
         assert_eq!(problems_columns, 7);
+        assert_eq!(agent_configs_columns, 4);
 
         // The partial unique index this migration exists for — confirm it's
         // actually created in Postgres, not just present in the SQL string.
@@ -271,6 +307,32 @@ mod tests {
             second_insert.is_err(),
             "a second OPEN problem for the same (rule_id, host_id) must be rejected by the partial unique index"
         );
+
+        // agent_configs' column defaults are what let Issue 9.3's read path
+        // treat a host with no row as "everything enabled, default
+        // intervals" without a special missing-row case — confirm inserting
+        // with only host_id actually reads back those defaults in real
+        // Postgres, not just in the SQL string.
+        crate::storage::HostRegistry::new(pool.clone())
+            .upsert_on_register("agent-configs-defaults-test-host", "test-host")
+            .await
+            .expect("seed host for the FK reference");
+        sqlx::query("INSERT INTO agent_configs (host_id) VALUES ($1)")
+            .bind("agent-configs-defaults-test-host")
+            .execute(&pool)
+            .await
+            .expect("insert agent_configs row relying on column defaults");
+
+        let (disabled_collectors, collector_intervals): (serde_json::Value, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT disabled_collectors, collector_intervals FROM agent_configs WHERE host_id = $1",
+            )
+            .bind("agent-configs-defaults-test-host")
+            .fetch_one(&pool)
+            .await
+            .expect("fetch defaulted agent_configs row");
+        assert_eq!(disabled_collectors, serde_json::json!([]));
+        assert_eq!(collector_intervals, serde_json::json!({}));
 
         drop(built);
     }
