@@ -12,9 +12,7 @@ use nest_data_postgres::{PostgresConfig, PostgresDataModule};
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage};
-use testcontainers_modules::postgres::Postgres as PostgresImage;
-use testcontainers_modules::testcontainers::ContainerAsync as PostgresContainerAsync;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 /// Holds a running Mosquitto container alive for the test's duration.
 ///
@@ -60,7 +58,7 @@ pub async fn start_broker() -> TestBroker {
 /// applied) alive for the test's duration.
 pub struct TestDb {
     #[allow(dead_code)]
-    pub container: PostgresContainerAsync<PostgresImage>,
+    pub container: ContainerAsync<GenericImage>,
     pub pool: PgPool,
 }
 
@@ -68,9 +66,16 @@ pub struct TestDb {
 /// and returns a fresh pool — same shape as
 /// `sparrow-core/src/storage.rs`'s own `start_postgres_with_schema` test
 /// helper (duplicated here, not imported: that one is private to
-/// `sparrow-core`'s test module).
+/// `sparrow-core`'s test module). `pgvector/pgvector:pg16`, not the plain
+/// `postgres` image — Issue 10.4's `resolved_incidents` migration needs
+/// the `vector` extension installable.
 pub async fn start_postgres_with_schema() -> TestDb {
-    let container = PostgresImage::default()
+    let container = GenericImage::new("pgvector/pgvector", "pg16")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
         .start()
         .await
         .expect("failed to start postgres testcontainer");

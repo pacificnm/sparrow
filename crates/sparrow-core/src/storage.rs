@@ -248,9 +248,9 @@ mod tests {
     use nest_data::DataModule;
     use nest_data_postgres::{PostgresConfig, PostgresDataModule};
     use sqlx::Row;
-    use testcontainers_modules::postgres::Postgres as PostgresImage;
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::ContainerAsync;
+    use testcontainers::core::{IntoContainerPort, WaitFor};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
     use crate::collector::MetricItem;
     use crate::transport::DataBatch;
@@ -265,14 +265,22 @@ mod tests {
     }
 
     /// Holds a running container alive for the test's duration; dropping it stops it.
-    /// Same testcontainers-rs convention as `pacificnm/nest`'s Phase 1-2 test support.
+    /// `pgvector/pgvector:pg16`, not the plain `postgres` image — Issue
+    /// 10.4's `resolved_incidents` migration needs the `vector` extension
+    /// installable. Same recipe as `nest-data-postgres`'s own
+    /// `test_support::start_postgres_with_pgvector`.
     struct TestDb {
-        _container: ContainerAsync<PostgresImage>,
+        _container: ContainerAsync<GenericImage>,
         pool: PgPool,
     }
 
     async fn start_postgres_with_schema() -> TestDb {
-        let container = PostgresImage::default()
+        let container = GenericImage::new("pgvector/pgvector", "pg16")
+            .with_exposed_port(5432.tcp())
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
             .start()
             .await
             .expect("failed to start postgres testcontainer");

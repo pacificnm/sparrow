@@ -79,6 +79,28 @@ pub fn all_migrations() -> Vec<Box<dyn Migration>> {
             )",
             "DROP TABLE agent_configs",
         )),
+        // Separate migration from 007_create_resolved_incidents below,
+        // matching nest-data-postgres's own test precedent (enabling the
+        // extension and creating a vector-column table are kept as two
+        // migrations there too) — a `vector` column type can't exist
+        // before this extension is enabled.
+        Box::new(nest_data_postgres::enable_vector_migration()),
+        Box::new(SqlMigration::new(
+            "007_create_resolved_incidents",
+            {
+                let dimension = crate::analyst::embedder::EMBEDDING_DIMENSION;
+                format!(
+                    "CREATE TABLE resolved_incidents (
+                        id BIGSERIAL PRIMARY KEY,
+                        host_id TEXT NOT NULL REFERENCES hosts(host_id),
+                        problem_description TEXT NOT NULL,
+                        resolution_notes TEXT NOT NULL,
+                        embedding vector({dimension}) NOT NULL
+                    )"
+                )
+            },
+            "DROP TABLE resolved_incidents",
+        )),
     ]
 }
 
@@ -88,17 +110,28 @@ mod tests {
     use nest_data::DataModule;
     use nest_data_postgres::{PostgresConfig, PostgresDataModule};
     use sqlx::PgPool;
-    use testcontainers_modules::postgres::Postgres as PostgresImage;
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::ContainerAsync;
+    use testcontainers::core::{IntoContainerPort, WaitFor};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
     struct TestDb {
-        _container: ContainerAsync<PostgresImage>,
+        _container: ContainerAsync<GenericImage>,
         url: String,
     }
 
+    /// `pgvector/pgvector:pg16`, not the plain `postgres` image — Issue
+    /// 10.4's `resolved_incidents` migration needs the `vector` extension
+    /// installable, which the vanilla image doesn't have (confirmed by
+    /// hitting "could not open extension control file ... vector.control"
+    /// against it). Same recipe as `nest-data-postgres`'s own
+    /// `test_support::start_postgres_with_pgvector`.
     async fn start_postgres() -> Result<TestDb, String> {
-        let container = PostgresImage::default()
+        let container = GenericImage::new("pgvector/pgvector", "pg16")
+            .with_exposed_port(5432.tcp())
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
             .start()
             .await
             .map_err(|error| format!("failed to start postgres testcontainer: {error}"))?;
@@ -127,8 +160,36 @@ mod tests {
                 "003_create_rules",
                 "004_create_problems",
                 "005_create_agent_configs",
+                // "000_enable_vector" is nest_data_postgres's own hardcoded
+                // id for its enable_vector_migration() helper — reused
+                // as-is (Issue 10.4's instruction) rather than
+                // reimplementing "CREATE EXTENSION IF NOT EXISTS vector;"
+                // locally just to keep the numeric prefix sequential.
+                // Application order (this Vec's order) is what actually
+                // matters, not the id's numeric prefix.
+                "000_enable_vector",
+                "007_create_resolved_incidents",
             ]
         );
+    }
+
+    #[test]
+    fn resolved_incidents_migration_uses_the_confirmed_embedding_dimension() {
+        let migrations = all_migrations();
+        let resolved_incidents = migrations
+            .iter()
+            .find(|migration| migration.id() == "007_create_resolved_incidents")
+            .expect("resolved_incidents migration");
+        let up_sql = resolved_incidents.up_sql();
+
+        // Issue 10.1's confirmed dimension (768, nomic-embed-text via
+        // Ollama) — must never silently drift back to
+        // nest-data-postgres's own 1536 (OpenAI) default.
+        assert!(up_sql.contains(&format!(
+            "vector({})",
+            crate::analyst::embedder::EMBEDDING_DIMENSION
+        )));
+        assert!(up_sql.contains("host_id TEXT NOT NULL REFERENCES hosts(host_id)"));
     }
 
     #[test]
@@ -219,6 +280,8 @@ mod tests {
                 "003_create_rules",
                 "004_create_problems",
                 "005_create_agent_configs",
+                "000_enable_vector",
+                "007_create_resolved_incidents",
             ]
         );
 
@@ -247,12 +310,18 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("agent_configs column count");
+        let resolved_incidents_columns: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'resolved_incidents'")
+                .fetch_one(&pool)
+                .await
+                .expect("resolved_incidents column count");
 
         assert_eq!(host_columns, 4);
         assert_eq!(metric_columns, 8);
         assert_eq!(rules_columns, 8);
         assert_eq!(problems_columns, 7);
         assert_eq!(agent_configs_columns, 4);
+        assert_eq!(resolved_incidents_columns, 5);
 
         // The partial unique index this migration exists for — confirm it's
         // actually created in Postgres, not just present in the SQL string.

@@ -18,9 +18,10 @@ use async_trait::async_trait;
 use nest_error::{NestError, NestResult};
 use nest_http_client::{HttpClientService, HttpRequest};
 use nest_task::{Task, TaskContext};
+use sparrow_core::analyst::embedder::Embedder;
 use sparrow_core::interval_task::run_on_interval;
 use sparrow_core::time::now_ms;
-use sparrow_core::trigger::{Problem, Rule};
+use sparrow_core::trigger::{Operator, Problem, Rule};
 use sqlx::PgPool;
 
 /// Periodically evaluates every enabled [`Rule`] against each applicable
@@ -50,15 +51,26 @@ pub struct AlertingTask {
     /// actually opens a new `Problem` — tied to that specific state
     /// transition, not to every evaluation pass (see `open_problem`).
     sinks: Vec<Arc<dyn NotificationSink>>,
+    /// Generates the embedding `resolve_problem` stores in
+    /// `resolved_incidents` (Issue 10.4) — a real `Embedder` in production
+    /// (e.g. `sparrow_core::analyst::embedder::OllamaEmbedder`), a test
+    /// double in tests that never need a real embedding provider.
+    embedder: Arc<dyn Embedder>,
 }
 
 impl AlertingTask {
-    pub fn new(pool: PgPool, interval: Duration, sinks: Vec<Arc<dyn NotificationSink>>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        interval: Duration,
+        sinks: Vec<Arc<dyn NotificationSink>>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Self {
         Self {
             pool,
             interval,
             condition_since: Mutex::new(HashMap::new()),
             sinks,
+            embedder,
         }
     }
 
@@ -132,7 +144,7 @@ impl AlertingTask {
                 // resolve, but also correct if this fires for a rule that
                 // never actually finished its sustain window elsewhere).
                 self.clear_condition_since(rule.id, host_id);
-                resolve_problem(&self.pool, problem.id).await?;
+                resolve_problem(&self.pool, &*self.embedder, rule, host_id, &problem).await?;
             }
             (true, Some(problem)) => {
                 // Already open — no duplicate Problem (the partial unique
@@ -300,13 +312,104 @@ async fn open_problem(
     Ok(problem)
 }
 
-async fn resolve_problem(pool: &PgPool, problem_id: i64) -> NestResult<()> {
+/// Marks `problem` resolved and records it in `resolved_incidents` (Issue
+/// 10.4) so `search_similar_incidents` can find it later.
+///
+/// Recording the incident is best-effort: a failure there (e.g. the
+/// embedding provider is unreachable) is logged and swallowed, never
+/// propagated — the actual state transition (marking the `Problem`
+/// resolved) must always succeed regardless, matching `WebhookSink`'s
+/// "never take down the core loop" precedent.
+async fn resolve_problem(
+    pool: &PgPool,
+    embedder: &dyn Embedder,
+    rule: &Rule,
+    host_id: &str,
+    problem: &Problem,
+) -> NestResult<()> {
+    let resolved_at = now_ms();
     sqlx::query("UPDATE problems SET status = 'resolved', resolved_at = $1 WHERE id = $2")
-        .bind(now_ms())
-        .bind(problem_id)
+        .bind(resolved_at)
+        .bind(problem.id)
         .execute(pool)
         .await
         .map_err(|error| db_error("failed to resolve problem", error))?;
+
+    if let Err(error) =
+        record_resolved_incident(pool, embedder, rule, host_id, problem, resolved_at).await
+    {
+        tracing::warn!(
+            error = %error,
+            problem_id = problem.id,
+            "failed to record resolved incident"
+        );
+    }
+
+    Ok(())
+}
+
+/// Synthesizes a description from the rule's `item_key`/threshold/duration
+/// — Sparrow has no UI yet for entering real resolution notes (Issue
+/// 10.4's explicit v1 scope), so this is what `search_similar_incidents`
+/// actually searches against for now.
+fn synthesize_problem_description(
+    rule: &Rule,
+    host_id: &str,
+    problem: &Problem,
+    resolved_at: i64,
+) -> String {
+    let duration_secs = (resolved_at - problem.opened_at).max(0) / 1000;
+    let comparison = match rule.operator {
+        Operator::GreaterThan => "above",
+        Operator::LessThan => "below",
+        Operator::Equal => "at",
+    };
+    format!(
+        "{key} on host {host_id} was {comparison} {threshold} for {duration_secs}s (last value {last_value})",
+        key = rule.item_key,
+        threshold = rule.threshold,
+        last_value = problem.last_value,
+    )
+}
+
+/// Generates an embedding of the synthesized description and inserts it
+/// into `resolved_incidents`. Split out from `resolve_problem` so its
+/// failure can be caught and logged there without needing a nested
+/// `match`/`if let` at the call site.
+async fn record_resolved_incident(
+    pool: &PgPool,
+    embedder: &dyn Embedder,
+    rule: &Rule,
+    host_id: &str,
+    problem: &Problem,
+    resolved_at: i64,
+) -> NestResult<()> {
+    let description = synthesize_problem_description(rule, host_id, problem, resolved_at);
+    // No free-text resolution-notes UI exists yet either (same Issue 10.4
+    // v1 scope note) — synthesized rather than left blank, so the column
+    // (NOT NULL) always has something meaningful.
+    let resolution_notes = format!(
+        "Auto-resolved: {key} returned to normal range.",
+        key = rule.item_key
+    );
+
+    let embedding = embedder
+        .embed(&description)
+        .await
+        .map_err(|error| NestError::unknown(error.to_string()))?;
+
+    sqlx::query(
+        "INSERT INTO resolved_incidents (host_id, problem_description, resolution_notes, embedding)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(host_id)
+    .bind(&description)
+    .bind(&resolution_notes)
+    .bind(pgvector::Vector::from(embedding))
+    .execute(pool)
+    .await
+    .map_err(|error| db_error("failed to record resolved incident", error))?;
+
     Ok(())
 }
 
@@ -405,14 +508,34 @@ impl NotificationSink for WebhookSink {
 
 #[cfg(test)]
 mod tests {
-    use sparrow_core::trigger::{Operator, ProblemStatus, Severity};
+    use sparrow_core::trigger::{ProblemStatus, Severity};
 
     use super::*;
+
+    /// Never actually invoked by most tests below (they don't resolve any
+    /// problem), and returns a fixed vector for the one that does — no
+    /// real embedding provider needed.
+    struct FakeEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FakeEmbedder {
+        async fn embed(&self, _text: &str) -> NestResult<Vec<f32>> {
+            Ok(vec![
+                0.0;
+                sparrow_core::analyst::embedder::EMBEDDING_DIMENSION
+            ])
+        }
+    }
 
     fn test_task() -> AlertingTask {
         let pool = PgPool::connect_lazy("postgres://sparrow-tests-unused@127.0.0.1/unused")
             .expect("lazy pool construction should not require a live connection");
-        AlertingTask::new(pool, Duration::from_secs(10), Vec::new())
+        AlertingTask::new(
+            pool,
+            Duration::from_secs(10),
+            Vec::new(),
+            Arc::new(FakeEmbedder),
+        )
     }
 
     #[tokio::test]
@@ -582,21 +705,29 @@ mod tests {
     use nest_data::DataModule;
     use nest_data_postgres::{PostgresConfig, PostgresDataModule};
     use sparrow_core::storage::HostRegistry;
-    use testcontainers_modules::postgres::Postgres as PostgresImage;
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::ContainerAsync;
+    use testcontainers::core::{IntoContainerPort, WaitFor};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
     /// Holds a running Postgres container (with Sparrow's migrations already
     /// applied) alive for the test's duration. Same recipe as
     /// `sparrow-core/src/storage.rs`'s own test module (duplicated, not
     /// imported — that one is private to `sparrow-core`'s tests).
+    /// `pgvector/pgvector:pg16`, not the plain `postgres` image — Issue
+    /// 10.4's `resolved_incidents` migration needs the `vector` extension
+    /// installable.
     struct TestDb {
-        _container: ContainerAsync<PostgresImage>,
+        _container: ContainerAsync<GenericImage>,
         pool: PgPool,
     }
 
     async fn start_postgres_with_schema() -> TestDb {
-        let container = PostgresImage::default()
+        let container = GenericImage::new("pgvector/pgvector", "pg16")
+            .with_exposed_port(5432.tcp())
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
             .start()
             .await
             .expect("failed to start postgres testcontainer");
@@ -670,7 +801,12 @@ mod tests {
     }
 
     fn task_for(pool: PgPool) -> AlertingTask {
-        AlertingTask::new(pool, Duration::from_secs(10), Vec::new())
+        AlertingTask::new(
+            pool,
+            Duration::from_secs(10),
+            Vec::new(),
+            Arc::new(FakeEmbedder),
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -744,6 +880,81 @@ mod tests {
                 .await
                 .expect("problem row should still exist, now resolved");
         assert_eq!(status, "resolved");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolving_a_problem_records_a_resolved_incident() {
+        let db = start_postgres_with_schema().await;
+        let rule = seed_rule(&db.pool, "quadrant-resolve-incident", 0).await;
+        let task = task_for(db.pool.clone());
+
+        task.evaluate_rule_for_host(&rule, "quadrant-resolve-incident", 95.0)
+            .await
+            .expect("first evaluation should open a problem");
+        task.evaluate_rule_for_host(&rule, "quadrant-resolve-incident", 10.0)
+            .await
+            .expect("second evaluation should resolve the open problem");
+
+        let description: String = sqlx::query_scalar(
+            "SELECT problem_description FROM resolved_incidents WHERE host_id = $1",
+        )
+        .bind("quadrant-resolve-incident")
+        .fetch_one(&db.pool)
+        .await
+        .expect("exactly one resolved_incidents row should exist for this host");
+        assert!(
+            description.contains(&rule.item_key),
+            "the synthesized description should mention the rule's item_key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_embedder_does_not_prevent_the_problem_from_resolving() {
+        struct FailingEmbedder;
+
+        #[async_trait::async_trait]
+        impl Embedder for FailingEmbedder {
+            async fn embed(&self, _text: &str) -> NestResult<Vec<f32>> {
+                Err(NestError::unknown("embedding provider unreachable"))
+            }
+        }
+
+        let db = start_postgres_with_schema().await;
+        let rule = seed_rule(&db.pool, "quadrant-resolve-embed-fails", 0).await;
+        let task = AlertingTask::new(
+            db.pool.clone(),
+            Duration::from_secs(10),
+            Vec::new(),
+            Arc::new(FailingEmbedder),
+        );
+
+        task.evaluate_rule_for_host(&rule, "quadrant-resolve-embed-fails", 95.0)
+            .await
+            .expect("first evaluation should open a problem");
+        task.evaluate_rule_for_host(&rule, "quadrant-resolve-embed-fails", 10.0)
+            .await
+            .expect(
+                "the problem must still resolve even though recording the incident failed \
+                 — that failure must never propagate",
+            );
+
+        assert!(
+            fetch_open_problem(&db.pool, rule.id, "quadrant-resolve-embed-fails")
+                .await
+                .expect("fetch_open_problem should succeed")
+                .is_none(),
+            "the problem should still have resolved"
+        );
+        let incident_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM resolved_incidents WHERE host_id = $1")
+                .bind("quadrant-resolve-embed-fails")
+                .fetch_one(&db.pool)
+                .await
+                .expect("resolved_incidents count");
+        assert_eq!(
+            incident_count, 0,
+            "no incident should be recorded when the embedder fails"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
