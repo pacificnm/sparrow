@@ -11,7 +11,7 @@ use nest_core::AppBuilder;
 use nest_task_runtime::{TaskManagerConfig, TaskManagerService};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage};
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use sparrow_agent::config::AgentConfig;
 
@@ -52,6 +52,57 @@ pub async fn start_broker() -> TestBroker {
         .get_host_port_ipv4(1883)
         .await
         .expect("container port");
+    TestBroker {
+        container,
+        host,
+        port,
+    }
+}
+
+/// Same as [`start_broker`], but binds the container's `1883` to a fixed,
+/// pre-reserved host port instead of letting Docker assign a random one.
+///
+/// Confirmed by hand against this sandbox's Docker daemon: a container
+/// published with a *dynamic* (`0`) host port gets a **different** host port
+/// after `stop()` + `start()` (same container, not recreated) — but a
+/// container published with an explicit fixed host port keeps that exact
+/// port across the same restart. Only `agent_resumes_publishing_after_
+/// broker_restart` needs this (it restarts the container mid-test and
+/// depends on the address staying reachable); `start_broker`'s dynamic port
+/// is still the right default everywhere else, since it avoids this
+/// function's port-reservation race entirely.
+#[allow(dead_code)]
+pub async fn start_broker_with_fixed_port() -> TestBroker {
+    // Reserve a free port by asking the OS for one, then release it — a
+    // small TOCTOU race (something else could grab the port before the
+    // container binds it), but the standard, widely-used pattern for
+    // fixed-port test infra, and short-lived enough here to be a
+    // non-issue in practice.
+    let host_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve a free port")
+        .local_addr()
+        .expect("local addr")
+        .port();
+
+    let container = GenericImage::new("eclipse-mosquitto", "2")
+        .with_wait_for(WaitFor::message_on_stderr("running"))
+        .with_mapped_port(host_port, 1883.tcp())
+        .start()
+        .await
+        .expect("failed to start mosquitto testcontainer");
+    let host = container
+        .get_host()
+        .await
+        .expect("container host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(1883)
+        .await
+        .expect("container port");
+    assert_eq!(
+        port, host_port,
+        "the container should be bound to the exact host port we reserved"
+    );
     TestBroker {
         container,
         host,

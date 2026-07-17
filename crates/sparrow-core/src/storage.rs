@@ -657,8 +657,10 @@ mod tests {
             "should be ordered newest first and exclude other keys"
         );
 
-        // Range bounds: only points 2 (ts=...002000) through 4
-        // (ts=...004000) inclusive.
+        // Range bounds: only values "3", "4", "5" fall in
+        // [...002000, ...004000] inclusive — value "N" was inserted at
+        // ts = 1_700_000_000_000 + (N - 1) * 1000 above (enumerate() is
+        // 0-indexed), so ts=...002000 is value "3", not "2".
         let ranged = history
             .history(
                 host_id,
@@ -674,7 +676,7 @@ mod tests {
                 .iter()
                 .map(|row| row.value.as_str())
                 .collect::<Vec<_>>(),
-            vec!["4", "3", "2"]
+            vec!["5", "4", "3"]
         );
 
         // Limit caps the result even when more rows match.
