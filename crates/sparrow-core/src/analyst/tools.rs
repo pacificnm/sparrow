@@ -228,13 +228,10 @@ struct SimilarIncident {
     distance: f32,
 }
 
-/// Depends on Issue 10.1's [`Embedder`] (resolved) and Issue 10.4's
-/// `resolved_incidents` table/migration (not yet added as of this issue —
-/// this function is real, not a stub, but has nothing to query until that
-/// migration lands; `VectorSearch` builds its SQL from plain strings, not
-/// a compile-time-checked query, so this compiles and dispatches
-/// correctly today and will start returning real hits the moment Issue
-/// 10.4's migration exists).
+/// Uses Issue 10.1's [`Embedder`] and Issue 10.4's `resolved_incidents`
+/// table (`crate::migrations`'s `007_create_resolved_incidents`,
+/// populated when a `Problem` resolves — see
+/// `crates/server/src/alerting.rs`'s `resolve_problem`).
 async fn search_similar_incidents(
     pool: &PgPool,
     embedder: &dyn Embedder,
@@ -271,24 +268,33 @@ async fn search_similar_incidents(
 mod tests {
     use nest_data::DataModule;
     use nest_data_postgres::{PostgresConfig, PostgresDataModule};
-    use testcontainers_modules::postgres::Postgres as PostgresImage;
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::ContainerAsync;
+    use testcontainers::core::{IntoContainerPort, WaitFor};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
     use super::*;
+    use crate::analyst::embedder::EMBEDDING_DIMENSION;
     use crate::storage::HostRegistry;
 
     /// Holds a running Postgres container (with Sparrow's migrations
     /// already applied) alive for the test's duration. Same recipe as
     /// `storage.rs`/`migrations.rs`/`alerting.rs`'s own test modules
     /// (duplicated, not imported — private to each module's tests).
+    /// `pgvector/pgvector:pg16`, not the plain `postgres` image — Issue
+    /// 10.4's `resolved_incidents` migration needs the `vector` extension
+    /// installable.
     struct TestDb {
-        _container: ContainerAsync<PostgresImage>,
+        _container: ContainerAsync<GenericImage>,
         pool: PgPool,
     }
 
     async fn start_postgres_with_schema() -> TestDb {
-        let container = PostgresImage::default()
+        let container = GenericImage::new("pgvector/pgvector", "pg16")
+            .with_exposed_port(5432.tcp())
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
             .start()
             .await
             .expect("failed to start postgres testcontainer");
@@ -504,21 +510,64 @@ mod tests {
         assert_eq!(rows_all.len(), 2);
     }
 
+    /// Returns a fixed, caller-supplied vector regardless of input text —
+    /// unlike `FakeEmbedder` (always all-zeros, fine for tests that never
+    /// inspect the embedding), this lets a test control exactly which
+    /// seeded `resolved_incidents` row should come back closest.
+    struct FixedEmbedder(Vec<f32>);
+
+    #[async_trait::async_trait]
+    impl Embedder for FixedEmbedder {
+        async fn embed(&self, _text: &str) -> nest_error::NestResult<Vec<f32>> {
+            Ok(self.0.clone())
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn search_similar_incidents_reports_a_missing_table_as_an_error_string_not_a_panic() {
+    async fn search_similar_incidents_returns_the_closest_seeded_incident_first() {
         let db = start_postgres_with_schema().await;
-        // Issue 10.4 hasn't added resolved_incidents yet — confirms the
-        // "never panics, folds errors into the JSON payload" contract
-        // holds even for a query against a table that doesn't exist.
+        let host_id = "tools-similar-incidents";
+        HostRegistry::new(db.pool.clone())
+            .upsert_on_register(host_id, "tools-test-host")
+            .await
+            .expect("seed host");
+
+        let mut near = vec![0.0_f32; EMBEDDING_DIMENSION];
+        near[0] = 1.0;
+        let mut far = vec![0.0_f32; EMBEDDING_DIMENSION];
+        far[0] = -1.0;
+
+        let near_id: i64 = sqlx::query_scalar(
+            "INSERT INTO resolved_incidents (host_id, problem_description, resolution_notes, embedding)
+             VALUES ($1, 'disk usage exceeded 90 percent on host web-01', 'auto-resolved', $2)
+             RETURNING id",
+        )
+        .bind(host_id)
+        .bind(pgvector::Vector::from(near.clone()))
+        .fetch_one(&db.pool)
+        .await
+        .expect("seed near resolved_incidents row");
+
+        sqlx::query(
+            "INSERT INTO resolved_incidents (host_id, problem_description, resolution_notes, embedding)
+             VALUES ($1, 'completely unrelated incident about memory', 'auto-resolved', $2)",
+        )
+        .bind(host_id)
+        .bind(pgvector::Vector::from(far))
+        .execute(&db.pool)
+        .await
+        .expect("seed far resolved_incidents row");
+
         let call = nest_ai::ToolCall::new(
             "search_similar_incidents",
-            serde_json::json!({ "description": "disk usage exceeded 90 percent" }),
+            serde_json::json!({ "description": "disk usage exceeded 90 percent", "limit": 1 }),
         );
-
-        let result = execute_tool(&call, &db.pool, &FakeEmbedder).await;
+        let result = execute_tool(&call, &db.pool, &FixedEmbedder(near)).await;
 
         let value: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
-        assert!(value["error"].is_string());
+        let rows = value.as_array().expect("rows should be an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], near_id.to_string());
     }
 
     #[tokio::test(flavor = "multi_thread")]

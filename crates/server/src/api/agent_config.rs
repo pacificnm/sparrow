@@ -176,21 +176,29 @@ mod tests {
     use nest_data::DataModule;
     use nest_data_postgres::{PostgresConfig, PostgresDataModule};
     use sparrow_core::storage::HostRegistry;
-    use testcontainers_modules::postgres::Postgres as PostgresImage;
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::ContainerAsync;
+    use testcontainers::core::{IntoContainerPort, WaitFor};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
     /// Holds a running Postgres container (with Sparrow's migrations
     /// already applied) alive for the test's duration. Same recipe as
     /// `sparrow-core/src/storage.rs`'s and `alerting.rs`'s own test
     /// modules (duplicated, not imported — private to each module's tests).
+    /// `pgvector/pgvector:pg16`, not the plain `postgres` image — Issue
+    /// 10.4's `resolved_incidents` migration needs the `vector` extension
+    /// installable.
     struct TestDb {
-        _container: ContainerAsync<PostgresImage>,
+        _container: ContainerAsync<GenericImage>,
         pool: PgPool,
     }
 
     async fn start_postgres_with_schema() -> TestDb {
-        let container = PostgresImage::default()
+        let container = GenericImage::new("pgvector/pgvector", "pg16")
+            .with_exposed_port(5432.tcp())
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
             .start()
             .await
             .expect("failed to start postgres testcontainer");
@@ -318,8 +326,7 @@ mod tests {
     use sparrow_agent::publisher::Publisher;
     use sparrow_agent::scheduler::BatchSink;
     use sparrow_core::transport::DataBatch;
-    use testcontainers::core::{IntoContainerPort, WaitFor};
-    use testcontainers::{ContainerAsync as MosquittoContainer, GenericImage};
+    use testcontainers::ContainerAsync as MosquittoContainer;
 
     /// Holds a running Mosquitto container alive for the test's duration.
     /// Same recipe as `crates/agent/tests/support/mod.rs` and
