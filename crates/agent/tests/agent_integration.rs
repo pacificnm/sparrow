@@ -18,7 +18,9 @@ use sparrow_agent::scheduler::{BatchSink, CollectorTask};
 use sparrow_core::collectors::default_collectors;
 use sparrow_core::transport::{DataBatch, Topics};
 
-use support::{start_broker, test_agent_config, test_task_manager, wait_until};
+use support::{
+    start_broker, start_broker_with_fixed_port, test_agent_config, test_task_manager, wait_until,
+};
 
 /// Spawns one real `CollectorTask` per `default_collectors()` entry,
 /// publishing through a real `Publisher` connected to `agent_config`'s
@@ -120,7 +122,11 @@ async fn real_collectors_publish_data_within_one_interval() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_resumes_publishing_after_broker_restart() {
-    let broker = start_broker().await;
+    // Needs a fixed (not Docker-assigned-random) host port: this test
+    // restarts the same container mid-run and depends on its address
+    // staying reachable afterward — see start_broker_with_fixed_port's doc
+    // comment for why start_broker's dynamic port can't be used here.
+    let broker = start_broker_with_fixed_port().await;
     let agent_config = test_agent_config("integration-restart-host", &broker, 1);
 
     let client = MqttClient::connect(&MqttConfig::new(
