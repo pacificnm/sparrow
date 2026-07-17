@@ -1479,6 +1479,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nest-ai"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "nest-error",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nest-app"
 version = "0.1.0"
 dependencies = [
@@ -2499,6 +2510,7 @@ name = "sparrow-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "nest-ai",
  "nest-core",
  "nest-data",
  "nest-data-postgres",

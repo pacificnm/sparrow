@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+nest-ai = { workspace = true }
 nest-data = { workspace = true }
+nest-data-postgres = { workspace = true }
 nest-http-client = { workspace = true }
 nest-mqtt = { workspace = true }
 nest-error = { workspace = true }
@@ -22,6 +24,5 @@ tokio = { version = "1", features = ["full"] }
 [dev-dependencies]
 nest-core = { workspace = true }
 nest-data = { workspace = true }
-nest-data-postgres = { workspace = true }
 testcontainers-modules = { version = "=0.11.6", features = ["postgres", "blocking"] }
 wiremock = "0.6"

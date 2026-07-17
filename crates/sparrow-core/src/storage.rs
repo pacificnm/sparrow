@@ -98,6 +98,21 @@ impl HostRegistry {
         .fetch_all(&self.pool)
         .await
     }
+
+    /// Returns one host's row, or `None` if `host_id` isn't registered —
+    /// for `analyst::tools::get_host_status` (Issue 10.2), which needs a
+    /// single-host lookup rather than `list()`'s full table scan.
+    pub async fn get(&self, host_id: &str) -> sqlx::Result<Option<HostRow>> {
+        sqlx::query_as::<_, HostRow>(
+            "SELECT host_id, hostname, online,
+                    (EXTRACT(EPOCH FROM last_seen) * 1000)::BIGINT AS last_seen_ms
+             FROM hosts
+             WHERE host_id = $1",
+        )
+        .bind(host_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
 }
 
 /// One row from `metric_history`, as returned to API clients — the raw
