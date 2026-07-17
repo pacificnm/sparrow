@@ -6,14 +6,13 @@ use nest_task::{Task, TaskContext};
 use sparrow_core::interval_task::run_on_interval;
 use sparrow_core::storage::HostRegistry;
 
-/// How often the sweep runs.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Production sweep cadence.
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// A host is considered stale (and gets marked offline) once its `last_seen`
-/// is older than this. ~3x Phase 6's 15s heartbeat interval — generous
-/// enough to tolerate a missed heartbeat or two from ordinary network
-/// jitter without falsely marking a healthy host offline.
-const STALE_AFTER_SECS: i64 = 45;
+/// Production staleness threshold: ~3x Phase 6's 15s heartbeat interval —
+/// generous enough to tolerate a missed heartbeat or two from ordinary
+/// network jitter without falsely marking a healthy host offline.
+const DEFAULT_STALE_AFTER_SECS: i64 = 45;
 
 /// Periodic backstop that marks hosts offline once their `last_seen` goes
 /// stale.
@@ -32,13 +31,32 @@ const STALE_AFTER_SECS: i64 = 45;
 /// before this sweep would ever run.
 pub struct OfflineWatch {
     registry: HostRegistry,
+    sweep_interval: Duration,
+    stale_after_secs: i64,
 }
 
 impl OfflineWatch {
     /// Creates a sweep that marks stale hosts offline via `registry` every
-    /// [`SWEEP_INTERVAL`].
-    pub fn new(registry: HostRegistry) -> Self {
-        Self { registry }
+    /// `sweep_interval`, once `last_seen` exceeds `stale_after_secs`.
+    ///
+    /// Cadence and threshold are constructor parameters, not hardcoded —
+    /// same reason `CollectorTask`/`HeartbeatTask` (Phase 6) take their
+    /// interval this way rather than baking it into the type: a
+    /// milestone-closing test proving this sweep's `Task::run` loop
+    /// actually fires and calls through to `mark_stale_offline` shouldn't
+    /// have to wait out a real 30s production interval to do it.
+    pub fn new(registry: HostRegistry, sweep_interval: Duration, stale_after_secs: i64) -> Self {
+        Self {
+            registry,
+            sweep_interval,
+            stale_after_secs,
+        }
+    }
+
+    /// Creates a sweep using Sparrow's production cadence/threshold
+    /// ([`DEFAULT_SWEEP_INTERVAL`], [`DEFAULT_STALE_AFTER_SECS`]).
+    pub fn with_defaults(registry: HostRegistry) -> Self {
+        Self::new(registry, DEFAULT_SWEEP_INTERVAL, DEFAULT_STALE_AFTER_SECS)
     }
 }
 
@@ -51,8 +69,12 @@ impl Task for OfflineWatch {
     }
 
     async fn run(&self, ctx: TaskContext) -> NestResult<()> {
-        run_on_interval(SWEEP_INTERVAL, ctx.cancel_token(), || async {
-            match self.registry.mark_stale_offline(STALE_AFTER_SECS).await {
+        run_on_interval(self.sweep_interval, ctx.cancel_token(), || async {
+            match self
+                .registry
+                .mark_stale_offline(self.stale_after_secs)
+                .await
+            {
                 Ok(0) => {}
                 Ok(marked) => tracing::info!(marked, "offline sweep marked stale hosts offline"),
                 Err(err) => tracing::warn!(error = %err, "offline sweep failed"),

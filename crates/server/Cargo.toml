@@ -14,5 +14,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
 
 [dev-dependencies]
+nest-core = { workspace = true }
+nest-data = { workspace = true }
+nest-data-postgres = { workspace = true }
+nest-task-runtime = { workspace = true }
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio"] }
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+testcontainers = "=0.23.3"
+testcontainers-modules = { version = "=0.11.6", features = ["postgres"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
