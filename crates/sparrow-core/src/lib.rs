@@ -6,3 +6,4 @@ pub mod migrations;
 pub mod storage;
 pub mod time;
 pub mod transport;
+pub mod trigger;
