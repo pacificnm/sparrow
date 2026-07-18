@@ -302,6 +302,7 @@ mod tests {
             collector_intervals: Default::default(),
             disabled_collectors: Vec::new(),
             mqtt_password: None,
+            mqtt_tls_ca_file: None,
         };
 
         let app = AppBuilder::new()

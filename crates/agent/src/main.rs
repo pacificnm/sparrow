@@ -7,8 +7,8 @@ use clap::{ArgMatches, Command};
 use nest_cli::{AsyncCliCommand, CliApp};
 use nest_config::ConfigService;
 use nest_core::AppContext;
-use nest_error::NestResult;
-use nest_mqtt::{LastWillConfig, MqttClient, MqttConfig, MqttQos};
+use nest_error::{NestError, NestResult};
+use nest_mqtt::{LastWillConfig, MqttClient, MqttConfig, MqttQos, TlsConfig};
 use nest_task::TaskManager;
 use nest_task_runtime::{RuntimeConfig, TaskManagerConfig, TaskManagerService, TaskRuntimeModule};
 use sparrow_agent::config::AgentConfig;
@@ -64,7 +64,7 @@ impl AsyncCliCommand for RunCommand {
         let config_service = ctx.service::<ConfigService>()?;
         let agent_config = AgentConfig::from_config_service(config_service)?;
 
-        let client = MqttClient::connect(&build_mqtt_config(&agent_config)).await?;
+        let client = MqttClient::connect(&build_mqtt_config(&agent_config)?).await?;
 
         publish_register_message(&client, &agent_config).await?;
 
@@ -128,7 +128,7 @@ impl AsyncCliCommand for RunCommand {
 /// own `host_id` would be scoped to nothing (every `pattern` topic would
 /// substitute the wrong value) or, without any username at all, rejected
 /// outright once the broker requires authentication.
-fn build_mqtt_config(config: &AgentConfig) -> MqttConfig {
+fn build_mqtt_config(config: &AgentConfig) -> NestResult<MqttConfig> {
     let mut mqtt_config = MqttConfig::new(&config.broker_host, config.broker_port, &config.host_id)
         .with_last_will(LastWillConfig {
             topic: Topics::heartbeat(&config.host_id),
@@ -139,7 +139,13 @@ fn build_mqtt_config(config: &AgentConfig) -> MqttConfig {
     if let Some(password) = &config.mqtt_password {
         mqtt_config = mqtt_config.with_credentials(&config.host_id, password);
     }
-    mqtt_config
+    if let Some(ca_file) = &config.mqtt_tls_ca_file {
+        let tls = TlsConfig::from_ca_file(ca_file).map_err(|error| {
+            NestError::unknown(format!("failed to read mqtt_tls_ca_file: {error}"))
+        })?;
+        mqtt_config = mqtt_config.with_tls(tls);
+    }
+    Ok(mqtt_config)
 }
 
 /// Publishes a one-time `RegisterMessage` on `Topics::register(host_id)`.
@@ -215,6 +221,7 @@ mod tests {
             broker_host: "mqtt.example".to_string(),
             broker_port: 8883,
             mqtt_password: mqtt_password.map(str::to_string),
+            mqtt_tls_ca_file: None,
             collector_intervals: BTreeMap::new(),
             disabled_collectors: Vec::new(),
         }
@@ -226,7 +233,7 @@ mod tests {
     /// to only its own topics.
     #[test]
     fn build_mqtt_config_sets_username_to_host_id_when_a_password_is_configured() {
-        let config = build_mqtt_config(&agent_config(Some("s3cret")));
+        let config = build_mqtt_config(&agent_config(Some("s3cret"))).expect("build_mqtt_config");
 
         assert_eq!(config.username.as_deref(), Some("web-01"));
         assert_eq!(config.password.as_deref(), Some("s3cret"));
@@ -234,7 +241,7 @@ mod tests {
 
     #[test]
     fn build_mqtt_config_sets_no_credentials_when_no_password_is_configured() {
-        let config = build_mqtt_config(&agent_config(None));
+        let config = build_mqtt_config(&agent_config(None)).expect("build_mqtt_config");
 
         assert_eq!(config.username, None);
         assert_eq!(config.password, None);
@@ -242,9 +249,39 @@ mod tests {
 
     #[test]
     fn build_mqtt_config_still_sets_the_last_will_regardless_of_credentials() {
-        let config = build_mqtt_config(&agent_config(Some("s3cret")));
+        let config = build_mqtt_config(&agent_config(Some("s3cret"))).expect("build_mqtt_config");
 
         let lwt = config.last_will.expect("last_will should be set");
         assert_eq!(lwt.topic, Topics::heartbeat("web-01"));
+    }
+
+    /// Found missing entirely while verifying Issue 13.3's systemd-agent
+    /// acceptance scenario against the real deploy/ stack (TLS-only
+    /// broker, no plaintext listener) — the agent had no way to connect to
+    /// it at all before this.
+    #[test]
+    fn build_mqtt_config_sets_tls_when_mqtt_tls_ca_file_is_configured() {
+        let mut config = agent_config(Some("s3cret"));
+        let ca_path = std::env::temp_dir().join(format!(
+            "sparrow-agent-main-test-ca-{}.crt",
+            std::process::id()
+        ));
+        std::fs::write(&ca_path, b"fake ca cert").expect("write temp ca file");
+        config.mqtt_tls_ca_file = Some(ca_path.to_str().expect("utf8 path").to_string());
+
+        let mqtt_config = build_mqtt_config(&config).expect("build_mqtt_config");
+
+        assert!(mqtt_config.tls.is_some(), "tls should be configured");
+        let _ = std::fs::remove_file(&ca_path);
+    }
+
+    #[test]
+    fn build_mqtt_config_errors_when_mqtt_tls_ca_file_does_not_exist() {
+        let mut config = agent_config(None);
+        config.mqtt_tls_ca_file = Some("/nonexistent/ca.crt".to_string());
+
+        let error = build_mqtt_config(&config)
+            .expect_err("a missing ca file should be an error, not silently ignored");
+        assert!(error.to_string().contains("mqtt_tls_ca_file"));
     }
 }

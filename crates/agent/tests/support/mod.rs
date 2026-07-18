@@ -125,6 +125,7 @@ pub fn test_agent_config(host_id: &str, broker: &TestBroker, interval_secs: u64)
         ]),
         disabled_collectors: Vec::new(),
         mqtt_password: None,
+        mqtt_tls_ca_file: None,
     }
 }
 
