@@ -4,3 +4,8 @@
 # on every build; capabilities/default.json's $schema reference is the only
 # thing pointing at it).
 /desktop/src-tauri/gen/
+
+# desktop/ui's own Node toolchain — installed dependencies and build output.
+/desktop/ui/node_modules/
+/desktop/ui/dist/
+/desktop/ui/tsconfig.tsbuildinfo

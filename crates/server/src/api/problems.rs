@@ -8,7 +8,8 @@
 
 use nest_error::NestError;
 use nest_http_serve::{HttpResult, Json, RequestContext, RouteGroup, ServeError};
-use sparrow_core::trigger::Problem;
+use serde::Serialize;
+use sparrow_core::trigger::{ProblemStatus, Severity};
 use sqlx::PgPool;
 
 /// Builds the `/api/problems` route.
@@ -27,9 +28,28 @@ async fn list_problems(ctx: RequestContext, pool: PgPool) -> HttpResult {
     Json(problems).into_response()
 }
 
-/// Returns every currently `Open` problem, optionally filtered by
-/// `host_id` — omitted means "all currently open problems across all
-/// hosts," per the phase-8 spec's own instruction.
+/// A `problems` row joined with its owning `rules.severity` — `Problem`
+/// itself (`sparrow_core::trigger`) has no `severity` field (that lives on
+/// `Rule`), but Issue 11.3's `ProblemsPanel.tsx` needs it to color-code the
+/// list, per the phase-11 spec's explicit "severity-colored" requirement.
+/// Endpoint-specific, not added to the shared `Problem` type — `tools.rs`'s
+/// `get_active_problems` (the AI tool) has no need for it.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub(crate) struct OpenProblem {
+    pub id: i64,
+    pub rule_id: i64,
+    pub host_id: String,
+    pub status: ProblemStatus,
+    pub opened_at: i64,
+    pub resolved_at: Option<i64>,
+    pub last_value: f64,
+    pub severity: Severity,
+}
+
+/// Returns every currently `Open` problem (joined with its rule's
+/// `severity`), optionally filtered by `host_id` — omitted means "all
+/// currently open problems across all hosts," per the phase-8 spec's own
+/// instruction.
 ///
 /// `pub(crate)`, not private: `api/analyst.rs`'s "explain this Problem"
 /// prompt synthesis (Issue 11.2) reuses this exact query rather than
@@ -37,25 +57,31 @@ async fn list_problems(ctx: RequestContext, pool: PgPool) -> HttpResult {
 pub(crate) async fn fetch_open_problems(
     pool: &PgPool,
     host_id: Option<&str>,
-) -> sqlx::Result<Vec<Problem>> {
+) -> sqlx::Result<Vec<OpenProblem>> {
     match host_id {
         Some(host_id) => {
-            sqlx::query_as::<_, Problem>(
-                "SELECT id, rule_id, host_id, status, opened_at, resolved_at, last_value
+            sqlx::query_as::<_, OpenProblem>(
+                "SELECT problems.id, problems.rule_id, problems.host_id, problems.status,
+                        problems.opened_at, problems.resolved_at, problems.last_value,
+                        rules.severity
                  FROM problems
-                 WHERE status = 'open' AND host_id = $1
-                 ORDER BY opened_at DESC",
+                 JOIN rules ON rules.id = problems.rule_id
+                 WHERE problems.status = 'open' AND problems.host_id = $1
+                 ORDER BY problems.opened_at DESC",
             )
             .bind(host_id)
             .fetch_all(pool)
             .await
         }
         None => {
-            sqlx::query_as::<_, Problem>(
-                "SELECT id, rule_id, host_id, status, opened_at, resolved_at, last_value
+            sqlx::query_as::<_, OpenProblem>(
+                "SELECT problems.id, problems.rule_id, problems.host_id, problems.status,
+                        problems.opened_at, problems.resolved_at, problems.last_value,
+                        rules.severity
                  FROM problems
-                 WHERE status = 'open'
-                 ORDER BY opened_at DESC",
+                 JOIN rules ON rules.id = problems.rule_id
+                 WHERE problems.status = 'open'
+                 ORDER BY problems.opened_at DESC",
             )
             .fetch_all(pool)
             .await
@@ -180,6 +206,11 @@ mod tests {
             .expect("fetch_open_problems should succeed");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].host_id, "problems-fetch-host-a");
+        assert_eq!(
+            filtered[0].severity,
+            sparrow_core::trigger::Severity::Warning,
+            "seed_open_problem's rule is seeded with severity 'warning'"
+        );
 
         let all = fetch_open_problems(&db.pool, None)
             .await
@@ -216,6 +247,11 @@ mod tests {
         let problems = body.as_array().expect("response should be an array");
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0]["host_id"], "problems-http-host-a");
+        assert_eq!(
+            problems[0]["severity"], "warning",
+            "the JSON response must include the joined rule's severity for \
+             ProblemsPanel.tsx's severity coloring (Issue 11.3)"
+        );
 
         server.shutdown().await;
     }
