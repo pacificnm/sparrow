@@ -6,22 +6,48 @@
 //! match that contract exactly, not one invented independently.
 
 use nest_error::NestResult;
-use sparrow_core::trigger::Problem;
+use serde::{Deserialize, Serialize};
+use sparrow_core::trigger::{ProblemStatus, Severity};
 
 use crate::state::AppState;
+
+/// Mirrors `crates/server/src/api/problems.rs`'s own `OpenProblem` wire
+/// shape exactly: a `problems` row joined with its owning rule's
+/// `severity`. `sparrow_core::trigger::Problem` itself has no `severity`
+/// field (that lives on `Rule`) — deserializing the server's response
+/// straight into `Problem` silently drops it (serde ignores unknown
+/// fields by default), which is exactly what this command used to do.
+/// `desktop/ui/src/lib/api.ts`'s `Problem` type has always declared
+/// `severity` as required, and `ProblemsPanel.tsx` (Issue 11.3) has always
+/// keyed its Chip color off of it — with the old `Problem`-typed return,
+/// every Problem the desktop app displayed had `severity: undefined` at
+/// runtime, breaking the "severity-colored" requirement silently (no
+/// error, just the wrong/missing chip color) since JS doesn't enforce
+/// TypeScript's "required" at the IPC boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenProblem {
+    pub id: i64,
+    pub rule_id: i64,
+    pub host_id: String,
+    pub status: ProblemStatus,
+    pub opened_at: i64,
+    pub resolved_at: Option<i64>,
+    pub last_value: f64,
+    pub severity: Severity,
+}
 
 #[tauri::command]
 pub async fn get_active_problems(
     state: tauri::State<'_, AppState>,
     host_id: Option<String>,
-) -> NestResult<Vec<Problem>> {
+) -> NestResult<Vec<OpenProblem>> {
     get_active_problems_via(&state, host_id.as_deref()).await
 }
 
 async fn get_active_problems_via(
     state: &AppState,
     host_id: Option<&str>,
-) -> NestResult<Vec<Problem>> {
+) -> NestResult<Vec<OpenProblem>> {
     let path = match host_id {
         Some(host_id) => format!("/api/problems?host_id={host_id}"),
         None => "/api/problems".to_string(),
@@ -50,7 +76,8 @@ mod tests {
             "status": "open",
             "opened_at": 1700000000000_i64,
             "resolved_at": null,
-            "last_value": 95.0
+            "last_value": 95.0,
+            "severity": "critical"
         })
     }
 
@@ -92,5 +119,30 @@ mod tests {
             .expect("get_active_problems_via should succeed");
 
         assert_eq!(problems.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_active_problems_via_preserves_severity_from_the_joined_rule() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/problems"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([sample_problem_json()])),
+            )
+            .mount(&server)
+            .await;
+
+        let problems = get_active_problems_via(&state_for(&server), None)
+            .await
+            .expect("get_active_problems_via should succeed");
+
+        assert_eq!(
+            problems[0].severity,
+            Severity::Critical,
+            "severity must survive the round trip — ProblemsPanel.tsx's chip \
+             color depends on it being present, not silently dropped like \
+             sparrow_core::trigger::Problem (no severity field) would do"
+        );
     }
 }
