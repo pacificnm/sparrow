@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+nest-ai = { workspace = true }
 nest-error = { workspace = true }
 nest-http-client = { workspace = true }
 nest-http-serve = { workspace = true }

@@ -47,11 +47,14 @@ const MAX_TOOL_ROUNDS: usize = 6;
 /// `run_analysis` command (Issue 11.1) sends and `POST /api/analyst/run`
 /// (Issue 11.2) receives — no separate `AnalysisModeWire` type, keeping one
 /// definition instead of two that could drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalysisMode {
     /// Fast per-Problem explanation — whichever provider is configured
-    /// runs its normal (cheap/fast) path.
+    /// runs its normal (cheap/fast) path. The default when `POST
+    /// /api/analyst/run`'s `mode` field is omitted (Issue 11.2's
+    /// `RunAnalysisRequest`).
+    #[default]
     Quick,
     /// Slower periodic health-trend report. See this module's doc comment
     /// for why this currently behaves identically to `Quick` for every
