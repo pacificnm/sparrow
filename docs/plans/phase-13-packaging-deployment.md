@@ -29,11 +29,16 @@ ExecStart=/usr/local/bin/sparrow-agent --config /etc/sparrow/agent.toml
 Restart=on-failure
 RestartSec=5
 User=sparrow-agent
-# CHECK: does the agent need any elevated permissions for the collectors it
-# runs (disk usage on all mounts, etc.)? sysinfo generally works unprivileged
-# on Linux for the metrics Sparrow collects (cpu/memory/disk usage), but
-# confirm this holds for whatever mount/filesystem setup the target hosts
-# actually use before assuming a fully unprivileged service user is sufficient.
+# RESOLVED (Issue 13.1): no elevated permissions needed. sysinfo's Linux
+# disk backend (checked its source directly, sysinfo-0.39.6's
+# src/unix/linux/disk.rs) reads /proc/mounts and calls statvfs() per
+# mount - a standard POSIX call needing only execute/traverse permission
+# on the mount point, not root or a capability, for ordinary local
+# filesystems. The one real caveat found is unrelated to permissions:
+# sysinfo's own source comments warn statvfs() on an NFS/CIFS mount using
+# the `hard` option can hang, not just fail - see deploy/README.md's
+# "Agent release build + systemd unit" section for what that implies for
+# hosts with such mounts.
 
 [Install]
 WantedBy=multi-user.target

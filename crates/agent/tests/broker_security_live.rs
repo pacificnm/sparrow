@@ -197,8 +197,14 @@ async fn generate_passwd_file(users: &[(&str, &str)]) -> Vec<u8> {
         // drained (that's how testcontainers learns the process actually
         // exited) - read stdout first, even though we don't need its
         // content, purely to wait for completion.
-        let output = result.stdout_to_vec().await.expect("drain mosquitto_passwd stdout");
-        let exit_code = result.exit_code().await.expect("mosquitto_passwd exit code");
+        let output = result
+            .stdout_to_vec()
+            .await
+            .expect("drain mosquitto_passwd stdout");
+        let exit_code = result
+            .exit_code()
+            .await
+            .expect("mosquitto_passwd exit code");
         assert_eq!(
             exit_code,
             Some(0),
@@ -211,7 +217,9 @@ async fn generate_passwd_file(users: &[(&str, &str)]) -> Vec<u8> {
         .exec(ExecCommand::new(["cat", "/mosquitto/config/passwd"]))
         .await
         .expect("exec cat passwd");
-    cat.stdout_to_vec().await.expect("read generated passwd file")
+    cat.stdout_to_vec()
+        .await
+        .expect("read generated passwd file")
 }
 
 struct SecuredBroker {
@@ -404,7 +412,10 @@ async fn wrong_credentials_are_rejected() {
     )
     .await
     .is_ok();
-    assert!(!arrived, "a client with the wrong password must not reach the broker");
+    assert!(
+        !arrived,
+        "a client with the wrong password must not reach the broker"
+    );
 }
 
 /// TLS: a plaintext connection attempt to the TLS-only listener port fails
@@ -429,9 +440,8 @@ async fn plaintext_connection_to_the_tls_listener_fails() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // No .with_tls(...) - a plain TCP client dialing the TLS-only port.
-    let plaintext_config =
-        MqttConfig::new(&broker.host, broker.tls_port, "plaintext-client")
-            .with_credentials("host-a", HOST_A_PASSWORD);
+    let plaintext_config = MqttConfig::new(&broker.host, broker.tls_port, "plaintext-client")
+        .with_credentials("host-a", HOST_A_PASSWORD);
     let plaintext_client = MqttClient::connect(&plaintext_config)
         .await
         .expect("client construction does not require a live connection");
@@ -451,5 +461,8 @@ async fn plaintext_connection_to_the_tls_listener_fails() {
     )
     .await
     .is_ok();
-    assert!(!received, "a plaintext client must not reach the TLS-only listener");
+    assert!(
+        !received,
+        "a plaintext client must not reach the TLS-only listener"
+    );
 }
