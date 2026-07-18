@@ -27,9 +27,9 @@ never commit `ca.key`/`server.key`):
 | File | Purpose |
 |------|---------|
 | `certs/ca.crt` | Distribute to every client that needs to verify the broker (`nest_mqtt::TlsConfig::from_ca_file`). Public, not a secret. |
-| `certs/ca.key` | The CA's private key. **Keep secret** — anyone with this can mint certificates your clients will trust. |
+| `certs/ca.key` | The CA's private key. **Keep secret**, mode 600 — anyone with this can mint certificates your clients will trust. Never mounted into the broker container. |
 | `certs/server.crt` | Mosquitto's `certfile`. Public. |
-| `certs/server.key` | Mosquitto's `keyfile`. **Keep secret.** |
+| `certs/server.key` | Mosquitto's `keyfile`. Sensitive, but mode **644** — bind-mounted into the broker container, whose own non-root user needs to read it; a bind mount keeps the host file's exact owner/mode, so 600 makes Mosquitto fail to start ("Unable to load server key file... Permission denied"). Accepted tradeoff for a bind-mount deployment; use a real secrets-management setup if that's not acceptable for your environment. |
 
 Verify the chain manually if you want to double-check before deploying:
 

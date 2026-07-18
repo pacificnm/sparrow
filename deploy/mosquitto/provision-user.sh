@@ -48,6 +48,16 @@ else
   mosquitto_passwd -b -c "$PASSWD_FILE" "$username" "$password"
 fi
 
+# mosquitto_passwd writes the file mode-0600, owned by whoever ran this
+# script (root, if run via `docker run ... mosquitto_passwd` the way this
+# repo's own testing does it) — found the hard way (Issue 13.2's real
+# docker-compose smoke test): when password_file is bind-mounted into the
+# actual broker container, Mosquitto's own non-root runtime user (not root)
+# can't open a 0600 file it doesn't own, and fails to start ("Unable to
+# open pwfile"). 644 is safe here — the file only ever contains salted
+# hashes (mosquitto_passwd's own job), never a plaintext password.
+chmod 644 "$PASSWD_FILE"
+
 echo
 echo "Provisioned MQTT user '$username' in $PASSWD_FILE"
 if [[ "$generated" -eq 1 ]]; then

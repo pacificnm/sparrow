@@ -65,14 +65,28 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 
 rm -f server.csr
 
-chmod 600 ca.key server.key
-chmod 644 ca.crt server.crt
+# ca.key is never mounted into the broker container (only needed here, to
+# sign a cert) - stays maximally restricted. server.key IS mounted (it's
+# Mosquitto's `keyfile`) - found the hard way (Issue 13.2's real
+# docker-compose smoke test) that a bind-mounted 0600 file keeps its exact
+# host owner/mode inside the container, and Mosquitto's own non-root
+# runtime user can't open a file it doesn't own, so the broker fails to
+# start ("Unable to load server key file... Permission denied") even
+# though the file is right there. 644 is the accepted tradeoff for a
+# bind-mount deployment (any local process on the host can read it) unless
+# you're using a real secrets-management setup — still far better than
+# committing it to git, which .gitignore already prevents.
+chmod 600 ca.key
+chmod 644 server.key ca.crt server.crt
 
 echo
 echo "Done. Generated in $CERTS_DIR:"
 echo "  ca.crt      - distribute to clients (nest_mqtt TlsConfig ca_cert)"
 echo "  ca.key      - broker CA private key, keep secret, do not distribute"
 echo "  server.crt  - Mosquitto's cafile pairs with server.crt/server.key below"
-echo "  server.key  - Mosquitto's keyfile, keep secret"
+echo "  server.key  - Mosquitto's keyfile. Broker-readable (644), not 600 —"
+echo "                bind-mounted into the container, whose own non-root"
+echo "                user needs to read it; see this script's own comment"
+echo "                above for why."
 echo
 echo "Verify: openssl verify -CAfile $CERTS_DIR/ca.crt $CERTS_DIR/server.crt"

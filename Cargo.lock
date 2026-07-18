@@ -2532,6 +2532,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nest-ai-ollama"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "futures-util",
+ "nest-ai",
+ "nest-config",
+ "nest-core",
+ "nest-error",
+ "nest-http",
+ "nest-http-client",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "nest-app"
 version = "0.1.0"
 dependencies = [
@@ -4276,8 +4294,12 @@ name = "sparrow-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "futures-util",
  "nest-ai",
+ "nest-ai-ollama",
+ "nest-cli",
+ "nest-config",
  "nest-core",
  "nest-data",
  "nest-data-postgres",

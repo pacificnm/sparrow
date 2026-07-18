@@ -25,7 +25,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/sparrow-agent --config /etc/sparrow/agent.toml
+ExecStart=/usr/local/bin/sparrow-agent --config /etc/sparrow/agent.toml run
+# `run` is required - nest-cli demands one of its registered subcommands
+# explicitly, `--config ...` alone fails with "requires a subcommand but
+# one was not provided" (Issue 13.2, found running the real binary).
 Restart=on-failure
 RestartSec=5
 User=sparrow-agent

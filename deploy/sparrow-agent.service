@@ -4,7 +4,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/sparrow-agent --config /etc/sparrow/agent.toml
+# `run` is a required subcommand, not optional (nest-cli requires one of
+# its registered subcommands explicitly - `sparrow-agent --config ...`
+# alone fails with "requires a subcommand but one was not provided"). The
+# phase-13 spec's own sketch omitted it; found running the actual compiled
+# binary this exact way while testing Issue 13.2's docker-compose stack.
+ExecStart=/usr/local/bin/sparrow-agent --config /etc/sparrow/agent.toml run
 Restart=on-failure
 RestartSec=5
 User=sparrow-agent

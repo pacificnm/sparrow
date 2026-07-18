@@ -1,0 +1,73 @@
+# Sparrow full-stack deployment: Mosquitto (TLS + ACLs, Issues 12.1/12.2) +
+# Postgres + server (Issue 13.2).
+#
+# Prerequisites (see README.md for the exact commands):
+#   1. mosquitto/generate-certs.sh   - CA + server cert into mosquitto/certs/
+#   2. mosquitto/provision-user.sh   - passwd entries for sparrow-server and
+#      each agent host_id
+#   3. secrets/postgres_password.txt - a single line, the Postgres password
+#      (gitignored — never commit this)
+#
+# Build context is the pacificnm/nest framework repo root, not this
+# directory or even the sparrow checkout alone — see
+# crates/server/Dockerfile's own header comment for why (sparrow-server's
+# path dependencies reach into core/ and modules/ two directories up from
+# apps/sparrow/). Run `docker compose` from the nest repo root:
+#   docker compose -f apps/sparrow/deploy/docker-compose.yml up
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/acl.conf:/mosquitto/config/acl.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd:ro
+      - ./mosquitto/certs:/mosquitto/config/certs:ro
+    ports:
+      - "8883:8883"
+
+  postgres:
+    # pgvector/pgvector:pg16, not plain postgres:16 — Issue 10.4's
+    # resolved_incidents migration needs the vector extension installable
+    # (CREATE EXTENSION vector; embedding vector(768) NOT NULL). Plain
+    # postgres:16 would fail migrations with "extension vector does not
+    # exist" the moment that migration ran. Verified directly: ran the
+    # real migration set against both images while writing this file.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: sparrow
+      POSTGRES_USER: sparrow
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - sparrow-postgres-data:/var/lib/postgresql/data
+
+  server:
+    build:
+      # Nest repo root — see the file-level comment above.
+      context: ../../..
+      dockerfile: apps/sparrow/crates/server/Dockerfile
+    depends_on:
+      - mosquitto
+      - postgres
+    volumes:
+      # server.toml's database_url has no password (postgresql://
+      # sparrow@postgres/sparrow) and sets database_password_file to the
+      # same mounted secret Postgres itself reads — ServerConfig::
+      # resolved_database_url() (crates/server/src/config.rs) injects it at
+      # startup. Never lands in this compose file, the image, or
+      # server.toml itself.
+      - ./server.toml:/etc/sparrow/server.toml:ro
+      - ./mosquitto/certs/ca.crt:/etc/sparrow/mosquitto-ca.crt:ro
+    ports:
+      - "8080:8080"
+    secrets:
+      - postgres_password
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+
+volumes:
+  sparrow-postgres-data:
