@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Default theme fallbacks, overridden at runtime by nest_theme_css
+   (see lib/nest.ts's applyThemeRootBlock). */
+:root {
+  --nest-color-background: #ffffff;
+  --nest-color-foreground: #1c293c;
+  --nest-color-primary: #003f2d;
+  --nest-color-secondary: #006a4d;
+  --nest-color-border: #b8bfc6;
+  --nest-color-surface: #f4f4f1;
+  --nest-color-accent: #69be28;
+  --nest-color-muted: #4a5568;
+  --nest-color-success: #006a4d;
+  --nest-color-warning: #b45309;
+  --nest-color-error: #b91c1c;
+  --nest-color-info: #003f2d;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  min-height: 100vh;
+  font-family:
+    "Segoe UI",
+    system-ui,
+    -apple-system,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Rich text content (AnalystPanel's rendered Markdown) — restore list
+   markers Tailwind's base reset strips. */
+.nest-rich-text ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+  margin: 0.25rem 0;
+}
+
+.nest-rich-text ol {
+  list-style: decimal;
+  padding-left: 1.5rem;
+  margin: 0.25rem 0;
+}
+
+.nest-rich-text a {
+  color: var(--nest-color-primary);
+  text-decoration: underline;
+}
