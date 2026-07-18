@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, PgPool};
 
 use crate::collector::ValueType;
@@ -11,7 +11,11 @@ use crate::transport::DataBatch;
 /// (`MetricItem::timestamp_ms`, `HeartbeatMessage::timestamp_ms`,
 /// `sparrow_core::time::now_ms`), rather than introducing `sqlx`'s
 /// `chrono`/`time` feature (not currently enabled) just for this one field.
-#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+///
+/// `Deserialize` (not just `Serialize`) so `desktop/src-tauri`'s
+/// `list_hosts` command (Issue 11.1) can decode the server's JSON response
+/// straight into this same type, rather than a duplicate client-side one.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct HostRow {
     pub host_id: String,
     pub hostname: String,
@@ -125,7 +129,11 @@ impl HostRegistry {
 /// Shared by both `latest_items` (one row per key) and `history` (a
 /// timestamp-ordered range for one key) — same five columns either way, so
 /// one row type for both rather than two structurally-identical ones.
-#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+///
+/// `Deserialize` (not just `Serialize`) so `desktop/src-tauri`'s
+/// `get_host_items` command (Issue 11.1) can decode the server's JSON
+/// response straight into this same type.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct MetricHistoryRow {
     pub collector: String,
     pub key: String,

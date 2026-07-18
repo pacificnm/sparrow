@@ -1,0 +1,8 @@
+# Sparrow desktop dashboard configuration.
+#
+# The server doesn't have to run on the same machine as this desktop app —
+# that's the whole point of an admin dashboard. Point base_url at wherever
+# your Sparrow server is actually running.
+
+[server]
+base_url = "http://127.0.0.1:8080"
