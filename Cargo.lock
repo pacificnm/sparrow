@@ -2677,6 +2677,7 @@ dependencies = [
  "nest-core",
  "nest-error",
  "rumqttc",
+ "rustls",
  "serde",
  "tokio",
  "tokio-stream",
