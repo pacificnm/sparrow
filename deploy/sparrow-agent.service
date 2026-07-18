@@ -1,0 +1,13 @@
+[Unit]
+Description=Sparrow monitoring agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sparrow-agent --config /etc/sparrow/agent.toml
+Restart=on-failure
+RestartSec=5
+User=sparrow-agent
+
+[Install]
+WantedBy=multi-user.target
