@@ -1,0 +1,22 @@
+# sparrow-server config for docker-compose.yml — mounted read-only to
+# /etc/sparrow/server.toml. No secrets in this file: the Postgres password
+# comes from database_password_file (the same Docker secret Postgres
+# itself reads), and the broker connection is TLS + credentialed per
+# Issues 12.1/12.2's deploy/mosquitto/ setup.
+
+[server]
+database_url = "postgresql://sparrow@postgres/sparrow"
+database_password_file = "/run/secrets/postgres_password"
+
+mqtt_broker_host = "mosquitto"
+mqtt_broker_port = 8883
+mqtt_tls_ca_file = "/etc/sparrow/mosquitto-ca.crt"
+# mqtt_password — provisioned via mosquitto/provision-user.sh sparrow-server
+# <password>, set that same password here (not committed — this file itself
+# should be treated as deployment-specific once mqtt_password is filled in).
+
+http_bind = "0.0.0.0:8080"
+
+ollama_base_url = "http://host.docker.internal:11434"
+ollama_completion_model = "llama3.1"
+ollama_embedding_model = "nomic-embed-text"

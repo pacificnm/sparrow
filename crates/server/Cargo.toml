@@ -5,27 +5,30 @@ edition.workspace = true
 
 [dependencies]
 nest-ai = { workspace = true }
+nest-ai-ollama = { workspace = true }
+nest-cli = { workspace = true, features = ["async"] }
+nest-config = { workspace = true }
+nest-core = { workspace = true }
+nest-data-postgres = { workspace = true }
 nest-error = { workspace = true }
 nest-http-client = { workspace = true }
 nest-http-serve = { workspace = true }
 nest-mqtt = { workspace = true }
 nest-task = { workspace = true }
+nest-task-runtime = { workspace = true }
 sparrow-core = { path = "../sparrow-core" }
 async-trait = "0.1"
+clap = "4"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 serde = { workspace = true }
 serde_json = "1"
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "json"] }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 
 [dev-dependencies]
-nest-core = { workspace = true }
 nest-data = { workspace = true }
-nest-data-postgres = { workspace = true }
-nest-task-runtime = { workspace = true }
 sparrow-agent = { path = "../agent" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 testcontainers = "=0.23.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -1,0 +1,4 @@
+# Deployment-specific, contains secrets or is generated — never commit.
+# See server.toml.example / README.md for how to create these.
+server.toml
+secrets/
