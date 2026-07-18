@@ -290,6 +290,7 @@ mod tests {
             password: None,
             last_will: None,
             capacity: 16,
+            tls: None,
         })
         .await
         .expect("client construction does not require a live connection");
