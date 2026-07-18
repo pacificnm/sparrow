@@ -4,6 +4,88 @@ Deployment artifacts for running Sparrow outside a dev checkout. Grows across
 Phase 12 (security hardening) and Phase 13 (packaging/deployment) — only
 what those phases have actually delivered so far is listed below.
 
+## Quick start (Issue 13.3 — both acceptance scenarios, verified end to end)
+
+Run from the **nest repo root** (`apps/sparrow` is this checkout, cloned
+per [`apps/README.md`](../../../apps/README.md)'s sibling-checkout
+convention — see "Docker build context" below for why that matters):
+
+```bash
+# 1. Certs — CN/SAN must include "mosquitto" (the Compose service name),
+#    not generate-certs.sh's own default "mosquitto.local".
+apps/sparrow/deploy/mosquitto/generate-certs.sh mosquitto mosquitto localhost 127.0.0.1
+
+# 2. Credentials — one call per principal: the server, and one per agent.
+apps/sparrow/deploy/mosquitto/provision-user.sh sparrow-server <server-password>
+apps/sparrow/deploy/mosquitto/provision-user.sh <agent-host-id> <agent-password>
+
+# 3. Postgres secret (gitignored).
+mkdir -p apps/sparrow/deploy/secrets
+echo -n '<postgres-password>' > apps/sparrow/deploy/secrets/postgres_password.txt
+
+# 4. Server config (gitignored) — fill in mqtt_password matching step 2's
+#    sparrow-server password.
+cp apps/sparrow/deploy/server.toml.example apps/sparrow/deploy/server.toml
+
+# 5. Bring up the stack.
+docker compose -f apps/sparrow/deploy/docker-compose.yml up
+```
+
+**`docker compose` not installed?** Confirmed this sandbox didn't have it —
+neither the `docker-compose` standalone binary nor the `compose` CLI
+plugin. Installed the official static plugin binary with no root needed:
+
+```bash
+mkdir -p ~/.docker/cli-plugins
+curl -sL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
+  -o ~/.docker/cli-plugins/docker-compose
+chmod +x ~/.docker/cli-plugins/docker-compose
+```
+
+**Scenario 1, verified for real** (not simulated): ran the actual
+`docker compose up` against a genuinely clean checkout state (fresh certs,
+fresh `passwd`, fresh secret, fresh `server.toml`) — all three services
+came up with no manual intervention beyond the four steps above, migrations
+applied automatically (`_nest_migrations`, `hosts`, `metric_history`,
+`rules`, `problems`, `resolved_incidents`, `agent_configs` all present on
+first boot), and `GET /api/hosts` responded `200 []` immediately.
+
+For the agent side (Issue 13.1's `sparrow-agent.service`), point
+`/etc/sparrow/agent.toml` at the same broker (`mqtt_tls_ca_file` set to
+step 1's `ca.crt`, `mqtt_password` matching step 2's per-agent password —
+**the agent had no TLS support at all until this issue**; see "Agent TLS"
+below), then:
+
+```bash
+sudo systemctl enable --now sparrow-agent
+sudo systemctl restart sparrow-agent   # scenario 2's actual check
+```
+
+**Scenario 2, verified for real**: no root available in the sandbox that
+wrote this, so tested via `systemctl --user` instead of a system-wide
+install — genuine systemd process supervision either way, just user- vs
+system-scoped (the issue's own text anticipates a VM/container standing in
+for "a real host," this is the same idea). Started the real compiled
+binary under the real unit file's `ExecStart`/`Restart`/`RestartSec`
+against the Compose stack above: it registered (`GET /api/hosts` showed
+the host, `online: true`), `systemctl --user restart` gave it a new PID,
+and afterward `GET /api/hosts` still showed **exactly one** row for that
+`host_id` (no duplicate) with a **newer** `last_seen_ms` than before the
+restart, and `GET /api/hosts/<id>/items` showed fresh metric timestamps
+newer than the restart — both host status and metric publishing resumed
+cleanly, nothing duplicated.
+
+### Agent TLS (found while verifying this issue)
+
+`AgentConfig` (`crates/agent/src/config.rs`) had `mqtt_password` (Issue
+12.2) but no `mqtt_tls_ca_file` — `ServerConfig` got the equivalent field
+in Issue 13.2, the agent never did. Since `deploy/mosquitto/mosquitto.conf`
+is a TLS-only listener with no plaintext fallback, **the agent could not
+connect to the deployed broker at all** before this fix. Added
+`mqtt_tls_ca_file: Option<String>` to `AgentConfig` and wired it into
+`build_mqtt_config` (`crates/agent/src/main.rs`) the same way
+`crates/server/src/main.rs` already does.
+
 ## Mosquitto TLS + auth/ACLs (Issues 12.1, 12.2)
 
 [`mosquitto/`](mosquitto/) — self-signed CA + server certificate generation
@@ -58,7 +140,7 @@ this).
 
 Restart-survival (`systemctl restart sparrow-agent` picks back up
 publishing without duplicate registration) is Issue 13.3's acceptance
-check, not this one's — this section only covers the build + unit file.
+check — see the "Quick start" section above for the verified result.
 
 **Found running the real binary this exact way (Issue 13.2):** the phase-13
 spec's own `ExecStart` sketch omitted the `run` subcommand — `nest-cli`
@@ -168,10 +250,9 @@ transient (see `crates/agent/tests/broker_security_live.rs`'s module doc).
 implement its own wait-for-postgres/wait-for-mosquitto logic, because it
 doesn't need to.
 
-Verified for real, not assumed: ran the actual `sparrow-server` binary
-(built via this same multi-stage Dockerfile) against Mosquitto (TLS +
-ACLs, real generated certs and `mosquitto_passwd`-provisioned credentials)
-and a real `pgvector/pgvector:pg16` container on a Docker network matching
-Compose's own service-name-based DNS, migrations applied automatically,
-and a message published as an ACL-scoped agent user flowed through
-`ingest.rs` into Postgres and out `GET /api/hosts` correctly.
+Verified for real, not assumed, twice: once via a manual Docker network
+standing in for Compose's mechanics (Issue 13.2), and again via the actual
+`docker compose up` command against a genuinely clean checkout (Issue
+13.3's "Quick start" section above) — both times migrations applied
+automatically and a message published as an ACL-scoped agent user flowed
+through `ingest.rs` into Postgres and out `GET /api/hosts` correctly.

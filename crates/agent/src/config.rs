@@ -23,6 +23,16 @@ pub struct AgentConfig {
     /// (Issue 12.2) will reject it.
     pub mqtt_password: Option<String>,
 
+    /// Path to a PEM-encoded CA certificate, enabling TLS (Issue 12.1) when
+    /// present. Without this, the agent cannot connect at all to a broker
+    /// configured per `deploy/mosquitto/mosquitto.conf` (TLS-only,
+    /// `listener 8883`, no plaintext listener) — found missing entirely
+    /// while verifying Issue 13.3's systemd-agent acceptance scenario
+    /// against the real deploy/ stack; `ServerConfig`
+    /// (`crates/server/src/config.rs`) already had the equivalent field
+    /// from Issue 13.2, this crate just never got it.
+    pub mqtt_tls_ca_file: Option<String>,
+
     /// Per-collector interval overrides; absent entries use the collector's
     /// own `default_interval_secs()`.
     #[serde(default)]
@@ -135,5 +145,25 @@ mqtt_password = "s3cret"
         ))
         .expect("parse failed");
         assert_eq!(cfg_with_password.mqtt_password, Some("s3cret".to_string()));
+    }
+
+    #[test]
+    fn mqtt_tls_ca_file_defaults_to_none_and_round_trips_when_present() {
+        let cfg = AgentConfig::from_config_service(&config_service(SAMPLE)).expect("parse failed");
+        assert_eq!(cfg.mqtt_tls_ca_file, None);
+
+        let cfg_with_tls = AgentConfig::from_config_service(&config_service(
+            r#"[agent]
+host_id = "my-test-host"
+broker_host = "localhost"
+broker_port = 8883
+mqtt_tls_ca_file = "/etc/sparrow/ca.crt"
+"#,
+        ))
+        .expect("parse failed");
+        assert_eq!(
+            cfg_with_tls.mqtt_tls_ca_file,
+            Some("/etc/sparrow/ca.crt".to_string())
+        );
     }
 }
