@@ -91,6 +91,7 @@ mod tests {
             broker_port: 1883,
             collector_intervals: Default::default(),
             disabled_collectors: Vec::new(),
+            mqtt_password: None,
         }
     }
 

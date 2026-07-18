@@ -34,15 +34,24 @@ Mosquitto's `acl_file` mechanism, scoped per the topic taxonomy from Phase
 
 ```
 # Each agent (authenticated via its own username, matching host_id) can only
-# touch its own topics.
-user agent-%u
-topic write sparrow/agents/%u/register
-topic write sparrow/agents/%u/heartbeat
-topic write sparrow/agents/%u/data
-topic read sparrow/agents/%u/config
-topic read sparrow/agents/%u/command
+# touch its own topics. `pattern`, not `user <name>` + bare `topic` — verified
+# against Mosquitto's real ACL file syntax (mosquitto-conf(5)) that `%u`
+# substitution is only valid in `pattern` lines. `user <name>` matches an
+# exact literal username only, so a `user agent-%u` line (an earlier version
+# of this sketch had one) is not valid Mosquitto config at all. `pattern`
+# rules apply globally to every connecting user, not just ones without a
+# more specific `user` block, so this isn't nested under one.
+pattern write sparrow/agents/%u/register
+pattern write sparrow/agents/%u/heartbeat
+pattern write sparrow/agents/%u/data
+pattern read sparrow/agents/%u/config
+pattern read sparrow/agents/%u/command
 
 # The server has broader access — reads everything, writes config/commands.
+# Exact-match on the literal username "sparrow-server", additive on top of
+# the pattern rules above (which also apply to sparrow-server itself, but
+# only grant it the harmless, never-used "sparrow/agents/sparrow-server/…"
+# topics — not access to any real agent's topics).
 user sparrow-server
 topic read sparrow/agents/+/register
 topic read sparrow/agents/+/heartbeat

@@ -106,7 +106,8 @@ impl AsyncCliCommand for RunCommand {
     }
 }
 
-/// Builds the agent's `MqttConfig`, including its Last-Will-and-Testament.
+/// Builds the agent's `MqttConfig`, including its Last-Will-and-Testament
+/// and, if configured, its broker credentials.
 ///
 /// The LWT publishes an **empty** retained payload on the same topic normal
 /// heartbeats use (`Topics::heartbeat(host_id)`) — deliberately not a second
@@ -119,15 +120,26 @@ impl AsyncCliCommand for RunCommand {
 /// this codebase to confirm the exact payload contract against — this is
 /// the simplest choice consistent with that description, not a guess backed
 /// by Phase 7 source.
+///
+/// The MQTT **username** is set to `host_id` too (Issue 12.2) — distinct
+/// from the client_id above, which was already `host_id` but plays no part
+/// in broker ACLs. `deploy/mosquitto/acl.conf`'s `pattern ... %u` rules
+/// match on the connecting *username*, so an agent whose username isn't its
+/// own `host_id` would be scoped to nothing (every `pattern` topic would
+/// substitute the wrong value) or, without any username at all, rejected
+/// outright once the broker requires authentication.
 fn build_mqtt_config(config: &AgentConfig) -> MqttConfig {
-    MqttConfig::new(&config.broker_host, config.broker_port, &config.host_id).with_last_will(
-        LastWillConfig {
+    let mut mqtt_config = MqttConfig::new(&config.broker_host, config.broker_port, &config.host_id)
+        .with_last_will(LastWillConfig {
             topic: Topics::heartbeat(&config.host_id),
             payload: Vec::new(),
             qos: MqttQos::AtLeastOnce,
             retain: true,
-        },
-    )
+        });
+    if let Some(password) = &config.mqtt_password {
+        mqtt_config = mqtt_config.with_credentials(&config.host_id, password);
+    }
+    mqtt_config
 }
 
 /// Publishes a one-time `RegisterMessage` on `Topics::register(host_id)`.
@@ -188,5 +200,51 @@ async fn wait_for_shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn agent_config(mqtt_password: Option<&str>) -> AgentConfig {
+        AgentConfig {
+            host_id: "web-01".to_string(),
+            broker_host: "mqtt.example".to_string(),
+            broker_port: 8883,
+            mqtt_password: mqtt_password.map(str::to_string),
+            collector_intervals: BTreeMap::new(),
+            disabled_collectors: Vec::new(),
+        }
+    }
+
+    /// Proves Issue 12.2's wiring: the agent's MQTT username must be its
+    /// own `host_id` (not left unset, and not e.g. a fixed "agent" string)
+    /// for `deploy/mosquitto/acl.conf`'s `pattern ... %u` rules to scope it
+    /// to only its own topics.
+    #[test]
+    fn build_mqtt_config_sets_username_to_host_id_when_a_password_is_configured() {
+        let config = build_mqtt_config(&agent_config(Some("s3cret")));
+
+        assert_eq!(config.username.as_deref(), Some("web-01"));
+        assert_eq!(config.password.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn build_mqtt_config_sets_no_credentials_when_no_password_is_configured() {
+        let config = build_mqtt_config(&agent_config(None));
+
+        assert_eq!(config.username, None);
+        assert_eq!(config.password, None);
+    }
+
+    #[test]
+    fn build_mqtt_config_still_sets_the_last_will_regardless_of_credentials() {
+        let config = build_mqtt_config(&agent_config(Some("s3cret")));
+
+        let lwt = config.last_will.expect("last_will should be set");
+        assert_eq!(lwt.topic, Topics::heartbeat("web-01"));
     }
 }

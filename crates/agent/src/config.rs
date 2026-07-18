@@ -15,6 +15,14 @@ pub struct AgentConfig {
     /// Port of the Mosquitto broker.
     pub broker_port: u16,
 
+    /// MQTT password. When present, the agent authenticates with username
+    /// `host_id` (Issue 12.2's ACL rules match on the connecting username
+    /// via `%u`, not client_id) and this password. `None` connects without
+    /// credentials — only viable against a broker with `allow_anonymous
+    /// true`; a broker configured per `deploy/mosquitto/mosquitto.conf`
+    /// (Issue 12.2) will reject it.
+    pub mqtt_password: Option<String>,
+
     /// Per-collector interval overrides; absent entries use the collector's
     /// own `default_interval_secs()`.
     #[serde(default)]
@@ -110,5 +118,22 @@ disabled_collectors = ["network", "disk"]
         assert!(cfg2.disabled_collectors.contains(&"disk".to_string()));
         // No [agent.collector_intervals] table given — stays empty.
         assert!(cfg2.collector_intervals.is_empty());
+    }
+
+    #[test]
+    fn mqtt_password_defaults_to_none_and_round_trips_when_present() {
+        let cfg = AgentConfig::from_config_service(&config_service(SAMPLE)).expect("parse failed");
+        assert_eq!(cfg.mqtt_password, None);
+
+        let cfg_with_password = AgentConfig::from_config_service(&config_service(
+            r#"[agent]
+host_id = "my-test-host"
+broker_host = "localhost"
+broker_port = 8883
+mqtt_password = "s3cret"
+"#,
+        ))
+        .expect("parse failed");
+        assert_eq!(cfg_with_password.mqtt_password, Some("s3cret".to_string()));
     }
 }

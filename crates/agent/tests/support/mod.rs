@@ -124,6 +124,7 @@ pub fn test_agent_config(host_id: &str, broker: &TestBroker, interval_secs: u64)
             ("disk".to_string(), interval_secs),
         ]),
         disabled_collectors: Vec::new(),
+        mqtt_password: None,
     }
 }
 
