@@ -380,6 +380,7 @@ mod tests {
                 ("disk".to_string(), 1),
             ]),
             disabled_collectors: Vec::new(),
+            mqtt_password: None,
         }
     }
 

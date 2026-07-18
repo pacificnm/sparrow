@@ -1,4 +1,4 @@
-# Mosquitto TLS setup (Issue 12.1)
+# Mosquitto TLS + auth/ACL setup (Issues 12.1, 12.2)
 
 Self-signed CA + server certificate for Mosquitto's TLS listener. Self-signed
 is fine for a self-hosted deployment — you control both the broker and every
@@ -37,7 +37,36 @@ Verify the chain manually if you want to double-check before deploying:
 openssl verify -CAfile certs/ca.crt certs/server.crt
 ```
 
-## 2. Configure Mosquitto
+## 2. Provision credentials
+
+Every connecting client needs a username/password before the broker will
+accept it (`allow_anonymous false`) — provision one per agent `host_id`,
+plus one for the server:
+
+```bash
+cd deploy/mosquitto
+./provision-user.sh sparrow-server               # random password, printed once
+./provision-user.sh web-01 "$(openssl rand -base64 24)"  # or supply your own
+```
+
+`provision-user.sh` wraps `mosquitto_passwd -b passwd <username> <password>`
+(`-c` only on the very first user, to create `passwd` — never on an
+existing file, which would silently wipe every other provisioned user).
+This is a **manual** step by design, not a self-service API endpoint —
+decided per Issue 12.2's own instruction to lean toward the manual path for
+a self-hosted v1 unless there's a concrete near-term need for self-service
+onboarding. `passwd` is gitignored; re-run `provision-user.sh` on the
+broker host whenever a new agent is added.
+
+**The agent's MQTT username must be its own `host_id`** — that's what
+`acl.conf`'s `pattern` rules (below) scope access to. Set
+`mqtt_password` in the agent's `[agent]` config section (see
+`crates/agent/src/config.rs`); `crates/agent/src/main.rs`'s
+`build_mqtt_config` then sets `username = host_id` automatically. Without
+`mqtt_password` set, the agent connects with no credentials at all, which a
+broker configured per this directory will reject outright.
+
+## 3. Configure Mosquitto
 
 `mosquitto.conf` in this directory sets:
 
@@ -46,15 +75,34 @@ listener 8883
 cafile /mosquitto/config/certs/ca.crt
 certfile /mosquitto/config/certs/server.crt
 keyfile /mosquitto/config/certs/server.key
+
+allow_anonymous false
+password_file /mosquitto/config/passwd
+acl_file /mosquitto/config/acl.conf
 ```
 
-Mount this directory's `mosquitto.conf` and `certs/` into the container (or
-copy them to wherever your Mosquitto install reads config from) so those
-paths resolve. `allow_anonymous true` is left as-is here deliberately —
-authentication (`password_file`) and per-agent authorization (`acl_file`)
-are Issue 12.2's scope, not this one.
+Mount this directory's `mosquitto.conf`, `certs/`, `passwd`, and `acl.conf`
+into the container (or copy them to wherever your Mosquitto install reads
+config from) so those paths resolve. `passwd` must exist (step 2) before
+Mosquitto will start with this config at all.
 
-## 3. Configure the client (`nest_mqtt`)
+### ACL rules (`acl.conf`)
+
+Scoped per the Phase 4 topic taxonomy: each agent can only write its own
+`register`/`heartbeat`/`data` and read its own `config`/`command`; the
+server reads everything and writes `config`/`command` for any agent.
+
+The phase-12 spec's own sketch used `user agent-%u` for the per-agent
+rules — verified against Mosquitto's real ACL file syntax
+([`mosquitto-conf(5)`](https://mosquitto.org/man/mosquitto-conf-5.html))
+that this is invalid: the `user <name>` directive matches an **exact
+literal username only**, `%u` substitution doesn't work there. The
+correct directive for "scope topic access to whatever username actually
+connected" is `pattern`, which applies globally to every authenticated
+user (not nested under a `user` line) — that's what `acl.conf` uses
+instead. See the comments in that file for the full reasoning.
+
+## 4. Configure the client (`nest_mqtt`)
 
 ```rust
 use nest_mqtt::{MqttConfig, TlsConfig};
@@ -78,6 +126,8 @@ only needs to authenticate the broker to clients, not the other way around.
 
 ## Acceptance
 
-A plaintext connection attempt to port `8883` must fail, and a client
-configured with `ca.crt` above must connect successfully — covered by
-Issue 12.3's test suite in this repo, not here.
+A plaintext connection attempt to port `8883` must fail; a properly
+TLS-and-credential-configured client connects; an agent authenticated as
+`host-a` attempting to publish under `sparrow/agents/host-b/data` is
+rejected by `acl.conf` — all covered by Issue 12.3's test suite in this
+repo, not here.
