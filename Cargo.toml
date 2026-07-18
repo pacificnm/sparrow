@@ -4,6 +4,7 @@ members = [
     "crates/sparrow-core",
     "crates/agent",
     "crates/server",
+    "desktop/src-tauri",
 ]
 
 [workspace.package]
@@ -24,4 +25,6 @@ nest-http-client = { path = "../../core/crates/nest-http-client" }
 nest-http-serve = { path = "../../core/crates/nest-http-serve" }
 nest-task = { path = "../../core/crates/nest-task" }
 nest-task-runtime = { path = "../../core/crates/nest-task-runtime" }
+nest-tauri = { path = "../../core/crates/nest-tauri" }
+nest-theme = { path = "../../core/crates/nest-theme" }
 serde = { version = "1", features = ["derive"] }

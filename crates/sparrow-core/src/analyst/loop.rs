@@ -40,7 +40,15 @@ use crate::analyst::tools;
 const MAX_TOOL_ROUNDS: usize = 6;
 
 /// The two analysis modes from the original project plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` (snake_case, matching every other wire enum in
+/// this codebase — `Operator`, `Severity`, `ProblemStatus`) so this one type
+/// serves both as the internal mode and the wire value `desktop/src-tauri`'s
+/// `run_analysis` command (Issue 11.1) sends and `POST /api/analyst/run`
+/// (Issue 11.2) receives — no separate `AnalysisModeWire` type, keeping one
+/// definition instead of two that could drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnalysisMode {
     /// Fast per-Problem explanation — whichever provider is configured
     /// runs its normal (cheap/fast) path.
