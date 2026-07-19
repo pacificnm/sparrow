@@ -6,6 +6,7 @@ import { AnalystPanel } from "./components/AnalystPanel";
 import { HostDetail } from "./components/HostDetail";
 import { HostList } from "./components/HostList";
 import { ProblemsPanel } from "./components/ProblemsPanel";
+import { TitleBar } from "./components/TitleBar";
 import {
   type Host,
   type MetricItem,
@@ -16,6 +17,7 @@ import {
   runAnalysis,
 } from "./lib/api";
 import { applyThemeRootBlock, fetchThemeCss } from "./lib/nest";
+import { quitApp } from "./lib/tauri";
 
 export function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
@@ -73,46 +75,54 @@ export function App() {
   }, [selectedHostId]);
 
   return (
-    <div className="mx-auto flex h-full max-w-5xl flex-col gap-8 overflow-auto p-8">
-      <header>
-        <Typography variant="h4">Sparrow</Typography>
-        <Typography variant="body2" className="text-nest-muted">
-          Fleet health dashboard
-        </Typography>
-      </header>
+    <div className="flex h-screen min-h-0 flex-col bg-nest-background text-nest-foreground">
+      <TitleBar
+        title="Sparrow"
+        onQuit={() => void quitApp()}
+        onAbout={() => window.alert("Sparrow Desktop\nFleet health dashboard")}
+      />
 
-      {loadError && (
-        <Typography variant="body2" className="text-nest-error">
-          {loadError}
-        </Typography>
-      )}
+      <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-8 overflow-auto p-8">
+        <header>
+          <Typography variant="h4">Sparrow</Typography>
+          <Typography variant="body2" className="text-nest-muted">
+            Fleet health dashboard
+          </Typography>
+        </header>
 
-      <section>
-        <Typography variant="h6" className="mb-3">
-          Hosts
-        </Typography>
-        <HostList hosts={hosts} selectedHostId={selectedHostId} onSelectHost={setSelectedHostId} />
-      </section>
+        {loadError && (
+          <Typography variant="body2" className="text-nest-error">
+            {loadError}
+          </Typography>
+        )}
 
-      {selectedHostId && (
         <section>
-          <HostDetail hostId={selectedHostId} items={items} />
+          <Typography variant="h6" className="mb-3">
+            Hosts
+          </Typography>
+          <HostList hosts={hosts} selectedHostId={selectedHostId} onSelectHost={setSelectedHostId} />
         </section>
-      )}
 
-      <section>
-        <Typography variant="h6" className="mb-3">
-          Problems
-        </Typography>
-        <ProblemsPanel problems={problems} />
-      </section>
+        {selectedHostId && (
+          <section>
+            <HostDetail hostId={selectedHostId} items={items} />
+          </section>
+        )}
 
-      <section>
-        <Typography variant="h6" className="mb-3">
-          AI Health Analyst
-        </Typography>
-        <AnalystPanel problems={problems} onRunAnalysis={runAnalysis} />
-      </section>
+        <section>
+          <Typography variant="h6" className="mb-3">
+            Problems
+          </Typography>
+          <ProblemsPanel problems={problems} />
+        </section>
+
+        <section>
+          <Typography variant="h6" className="mb-3">
+            AI Health Analyst
+          </Typography>
+          <AnalystPanel problems={problems} onRunAnalysis={runAnalysis} />
+        </section>
+      </div>
     </div>
   );
 }

@@ -12,6 +12,9 @@
     "tauri:build": "cd .. && node ui/node_modules/@tauri-apps/cli/tauri.js build"
   },
   "dependencies": {
+    "@fortawesome/fontawesome-svg-core": "^7.3.0",
+    "@fortawesome/free-solid-svg-icons": "^7.3.0",
+    "@fortawesome/react-fontawesome": "^3.3.1",
     "@nest/components": "../../../../core/crates/nest-react-components",
     "@tauri-apps/api": "^2.4.0",
     "clsx": "^2.1.1",
