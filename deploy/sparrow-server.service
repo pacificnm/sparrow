@@ -1,0 +1,15 @@
+[Unit]
+Description=Sparrow monitoring server
+After=network-online.target postgresql.service mosquitto.service
+Wants=network-online.target
+
+[Service]
+# --config is a global flag (nest-cli convention) and must precede the
+# subcommand, same as sparrow-agent.service - see that file's own comment.
+ExecStart=/usr/local/bin/sparrow-server --config /etc/sparrow/server.toml run
+Restart=on-failure
+RestartSec=5
+User=sparrow-server
+
+[Install]
+WantedBy=multi-user.target
