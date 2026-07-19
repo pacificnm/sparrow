@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Sparrow desktop dashboard (Tauri + React) — standard ./build interface.
+#
+# Nothing under desktop/ had a ./build wrapper before this — apps/README.md's
+# own standard says every product's desktop app gets one (templates/desktop/build),
+# but Sparrow's was never created. Modeled directly on that template rather
+# than invented fresh.
+set -euo pipefail
+
+APP_ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+# Find the workspace/nest root: the nearest ancestor that contains
+# scripts/nest-build/lib.sh. Works at any depth under apps/. Falls back to a
+# `nest` checkout cloned beside a standalone app.
+NEST_ROOT=""
+dir="$APP_ROOT"
+while [[ "$dir" != "/" ]]; do
+  if [[ -f "$dir/scripts/nest-build/lib.sh" ]]; then
+    NEST_ROOT="$dir"
+    break
+  fi
+  dir="$(dirname "$dir")"
+done
+if [[ -z "$NEST_ROOT" && -f "$APP_ROOT/../nest/scripts/nest-build/lib.sh" ]]; then
+  NEST_ROOT="$(cd "$APP_ROOT/../nest" && pwd)"
+fi
+if [[ -z "$NEST_ROOT" ]]; then
+  echo "error: cannot find scripts/nest-build/lib.sh (no Nest workspace above this app, and no nest/ clone beside it)" >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$NEST_ROOT/scripts/nest-build/lib.sh"
+
+export NEST_BUILD_PROFILE=tauri
+export NEST_UI_DIR=ui
+export NEST_CARGO_MANIFEST=src-tauri/Cargo.toml
+export NEST_RUST_PACKAGE="${NEST_RUST_PACKAGE:-sparrow-desktop}"
+export NEST_RUST_BIN="${NEST_RUST_BIN:-$NEST_RUST_PACKAGE}"
+export NEST_TAURI_MODE="${NEST_TAURI_MODE:-bundle}"
+
+nest_build_main "$@"

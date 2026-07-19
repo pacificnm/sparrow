@@ -185,6 +185,8 @@ redundant paths to the same signal.
 
 ## Related
 
+- [`docs/getting-started.md`](getting-started.md) — how to build and run
+  every component described above, from nothing.
 - [`docs/authoring-collectors.md`](authoring-collectors.md) — the
   Collector trait, in depth.
 - [`docs/plans/sparrow-project-plan.md`](plans/sparrow-project-plan.md) —

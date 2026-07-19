@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "tauri:dev": "tauri dev -c ../src-tauri/tauri.conf.json",
+    "tauri:build": "tauri build -c ../src-tauri/tauri.conf.json"
   },
   "dependencies": {
     "@nest/components": "../../../../core/crates/nest-react-components",

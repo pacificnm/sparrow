@@ -7,8 +7,9 @@ lightweight **Agents** run on monitored hosts, publish metrics over MQTT, and
 a central **Server** ingests, stores, evaluates, and (eventually) explains
 what's going on.
 
-> **Status:** Planning complete (plan v5, 15 documents). No implementation
-> has started yet. Framework prerequisite work (Phases 1–3) is next.
+> **Status:** All 14 phases implemented, tested, and documented. Sparrow is
+> a working system — see [`docs/getting-started.md`](docs/getting-started.md)
+> to build and run it.
 
 ---
 
@@ -56,12 +57,12 @@ modules, not one-off hacks bolted onto the product repo.
 ```
 sparrow/
 ├── crates/
-│   ├── core/       # shared domain logic: Collector trait, topic taxonomy,
-│   │                 storage, trigger/alerting model, AI analyst tools
-│   ├── agent/       # nest-cli binary
-│   └── server/      # nest-http-serve binary
-├── desktop/         # nest-tauri dashboard (later phase)
-└── deploy/          # systemd units, docker-compose, broker config
+│   ├── sparrow-core/  # shared domain logic: Collector trait, topic taxonomy,
+│   │                    storage, trigger/alerting model, AI analyst tools
+│   ├── agent/         # nest-cli binary (sparrow-agent)
+│   └── server/        # nest-http-serve binary (sparrow-server)
+├── desktop/           # nest-tauri dashboard
+└── deploy/            # systemd units, docker-compose, broker config
 ```
 
 ## Built on `nest`
@@ -152,5 +153,10 @@ either provider directly.
 
 ## Status
 
-Planning is done. Next step: open the 23-issue GitHub breakdown against
-`pacificnm/nest` and start on Phase 1 (`nest-data-postgres` hardening).
+All 14 phases are implemented and merged: collectors, agent, server,
+alerting, config push, the AI Health Analyst, the desktop dashboard,
+security hardening (TLS + broker ACLs), packaging/deployment, and this
+documentation set. See [`docs/getting-started.md`](docs/getting-started.md)
+to build and run every component, [`docs/architecture.md`](docs/architecture.md)
+for how the pieces fit together, and [`docs/api-reference.md`](docs/api-reference.md)
+for the HTTP API.
