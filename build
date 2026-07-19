@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Sparrow workspace — standard ./build interface.
+#
+# No previous phase created this file. Issue 14.5's own acceptance
+# criterion ("./build check passes") assumed one existed; it didn't, on
+# either checked-out product this session verified against
+# (pacificnm/loon, pacificnm/airtable-sync each have their own root
+# ./build, following the app standard every Nest product is supposed to).
+#
+# Sparrow's workspace has two real binaries (sparrow-agent, sparrow-server)
+# with no single shared entrypoint to run, so this uses the same
+# NEST_BUILD_PROFILE=workspace the nest framework repo's own root ./build
+# uses for itself, not the single-binary "rust" profile
+# templates/rust-server/build defaults to — `./build run`/`./build dev`
+# are intentionally undefined here for the same reason they're undefined
+# at the framework's own workspace root (build/test/check/clean only; run
+# either binary directly via `cargo run -p sparrow-agent`/
+# `-p sparrow-server`, or the deploy/ systemd unit / Docker image).
+set -euo pipefail
+
+APP_ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+# apps/sparrow -> apps -> nest root (2 levels), matching
+# apps/README.md's documented convention: clone pacificnm/nest, then
+# clone pacificnm/sparrow into nest/apps/sparrow/. Falls back to a
+# `nest` checkout cloned beside this one, for anyone who didn't follow
+# that layout.
+NEST_ROOT="$(cd "$APP_ROOT/../.." 2>/dev/null && pwd || true)"
+if [[ -z "$NEST_ROOT" || ! -f "$NEST_ROOT/scripts/nest-build/lib.sh" ]]; then
+  NEST_ROOT="$(cd "$APP_ROOT/../nest" 2>/dev/null && pwd || true)"
+fi
+if [[ -z "$NEST_ROOT" || ! -f "$NEST_ROOT/scripts/nest-build/lib.sh" ]]; then
+  echo "error: cannot find scripts/nest-build/lib.sh (clone pacificnm/nest, then clone pacificnm/sparrow into nest/apps/sparrow/)" >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$NEST_ROOT/scripts/nest-build/lib.sh"
+
+export NEST_BUILD_PROFILE=workspace
+
+nest_build_main "$@"
